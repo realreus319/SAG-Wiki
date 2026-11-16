@@ -28,7 +28,9 @@ docker compose up -d --build
 
 启动后打开 `http://127.0.0.1:3001/ui/`。数据存在具名卷 `sag-parse-data` 里；想用本地目录挂载时，把 `docker-compose.yml` 里的 `volumes` 改成 `./data:/data`。
 
-不填 key 也能启动（MinerU 未配置时走本地降级），key 也可在 Web 设置页里粘贴。环境变量里的 key 只驻留内存，不写入磁盘。
+镜像自带全部本地解析依赖，开箱即用：Docling 文档组件与音视频组件都在构建期装好了（见下节），容器内不再下载安装；首次使用组件时服务把它从镜像复制进数据卷（本地复制，不联网）。不填 key 也能启动（MinerU 未配置时走本地降级），key 也可在 Web 设置页里粘贴。环境变量里的 key 只驻留内存，不写入磁盘。
+
+首次构建要从 GitHub / PyPI / HuggingFace 下载约 6GB，耗时约 15–40 分钟；日常 `docker compose up -d` 不带 `--build` 不会重建。amd64 宿主机上构建 arm64 镜像会走 QEMU 模拟，Docling 安装步骤明显更慢，arm64 建议用原生 ARM 构建机或 buildx 远程 ARM 节点。
 
 多架构发布（一次构建两个架构并推送）：
 
@@ -48,6 +50,22 @@ sag parse-server --port 3002 --data-dir /path/to/data
 默认监听 `0.0.0.0:3001`，数据目录默认为 SAG 数据目录。服务启动后在数据目录下生成 `parse-uploads/`、`parse-outputs/`（内含 `docs/` 与 `temp/`）、`parse.db` 与 `sag.sqlite`。
 
 服务无鉴权，仅供内网使用，不要直接暴露到公网。
+
+## Docling 组件
+
+本地解析靠两个 Docling 组件，Docker 镜像在构建期已全部装好；不用 Docker 时可用 CLI 安装：
+
+```sh
+sag docling install                  # 默认同时装文档与音视频两个组件
+sag docling install --profile documents   # 只装文档组件
+sag docling install --profile media       # 只装音视频组件
+sag docling install --data-dir /path/to/data  # 指定数据目录，默认 SAG 数据目录
+```
+
+- **文档组件**：Python 3.12 + docling + 布局、TableFormer、RapidOCR 模型；html、msg、zip 等格式与 PDF/Office 的本地降级都靠它。
+- **音视频组件**：openai-whisper + whisper-tiny 模型 + 内置 ffmpeg；音视频走 Docling media 时用它。
+
+组件装在数据目录下（`docling/` 与 `docling/media/`），一次安装后一直可用。镜像里预装的组件在 `/opt/sag/docling-documents` 与 `/opt/sag/docling-media`，服务通过环境变量 `SAG_DOCLING_COMPONENT_DIR` / `SAG_DOCLING_MEDIA_COMPONENT_DIR` 找到它们，首次使用时复制进数据目录；组件已在数据目录里时不再复制。自己预构建组件目录也可以用这两个环境变量指过去（目录里须有 `manifest.json`、Python、site-packages 与模型）。
 
 ## Web UI
 
@@ -123,7 +141,7 @@ curl http://127.0.0.1:3001/tasks/<task_id>/result
 ## 已知限制
 
 - 队列并发改动即时生效；输出目录改动只影响之后创建的任务。
-- html、msg、zip 等格式 anydoc 不处理，只能走 Docling；未安装 Docling 文档组件时这类任务会失败并在错误中说明原因。
+- html、msg、zip 等格式 anydoc 不处理，只能走 Docling；Docker 镜像自带 Docling 组件，不用 Docker 时未安装会失败并在错误中说明原因，可用 `sag docling install` 安装。
 - MinerU 的 429 切换发生在任务粒度，同一任务内不重试另一 Key。
 - 视频任务在视觉模型未配置时失败（ASR 阶段已完成，错误原文会说明原因）。
 - 任务列表的 `search` 按上传路径（含 MD5 分层目录）与 `task_id` 匹配，原始文件名未单独保存，按原文件名搜索只能命中扩展名或 MD5 子串。

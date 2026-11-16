@@ -142,7 +142,98 @@ impl ParseServer {
             None,
             None,
         )?;
+        // Prebuilt Docling components (e.g. baked into a Docker image) are
+        // staged into the data directory on first start. Only runs for
+        // profiles that are not installed yet and whose
+        // SAG_DOCLING_*_COMPONENT_DIR variable points at a directory;
+        // nothing is downloaded. Runs in the background so startup stays
+        // fast; a task that needs Docling before staging finishes still
+        // reports the component as missing, exactly as before.
+        server.maybe_stage_prebuilt_docling();
         Ok(server)
+    }
+
+    fn maybe_stage_prebuilt_docling(self: &Arc<Self>) {
+        use sag_protocol::DoclingProfile;
+        let docling = std::sync::Arc::new(crate::docling::Docling::new(&self.data_dir));
+        let mut wanted: Vec<DoclingProfile> = Vec::new();
+        for (profile, var) in [
+            (DoclingProfile::Documents, "SAG_DOCLING_COMPONENT_DIR"),
+            (DoclingProfile::Media, "SAG_DOCLING_MEDIA_COMPONENT_DIR"),
+        ] {
+            if docling.has_profile(profile) {
+                continue;
+            }
+            match std::env::var_os(var) {
+                Some(dir) if std::path::Path::new(&dir).is_dir() => wanted.push(profile),
+                Some(dir) => {
+                    let _ = self.log(
+                        "warn",
+                        None,
+                        None,
+                        &format!(
+                            "预装 Docling 组件目录不存在：{}={}",
+                            var,
+                            dir.to_string_lossy()
+                        ),
+                        Some("docling"),
+                        None,
+                    );
+                }
+                None => {}
+            }
+        }
+        if wanted.is_empty() {
+            return;
+        }
+        let server = self.clone();
+        std::thread::spawn(move || {
+            let _ = server.log(
+                "info",
+                None,
+                None,
+                "正在从预装组件准备 Docling（本地复制，不下载）…",
+                Some("docling"),
+                None,
+            );
+            if let Err(error) = docling.start_profiles(wanted) {
+                let _ = server.log(
+                    "error",
+                    None,
+                    None,
+                    &format!("预装 Docling 组件准备失败：{error:#}"),
+                    Some("docling"),
+                    None,
+                );
+                return;
+            }
+            loop {
+                let status = docling.status();
+                if !status.running {
+                    if status.stage == "done" {
+                        let _ = server.log(
+                            "info",
+                            None,
+                            None,
+                            "Docling 组件已就绪。",
+                            Some("docling"),
+                            None,
+                        );
+                    } else if let Some(error) = status.error {
+                        let _ = server.log(
+                            "error",
+                            None,
+                            None,
+                            &format!("预装 Docling 组件准备失败：{error}"),
+                            Some("docling"),
+                            None,
+                        );
+                    }
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+        });
     }
 
     pub fn settings(&self) -> Result<Settings> {

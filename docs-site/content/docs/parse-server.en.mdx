@@ -28,7 +28,9 @@ docker compose up -d --build
 
 Then open `http://127.0.0.1:3001/ui/`. Data lives in the named volume `sag-parse-data`; to use a local directory instead, change `volumes` in `docker-compose.yml` to `./data:/data`.
 
-It also starts without a key (local fallback when MinerU is unconfigured); keys can be pasted later on the Web settings page. Keys from environment variables stay in memory only and are never written to disk.
+The image ships with all local parsing dependencies, ready to use: both the Docling document component and the media component are installed at build time (see below), so the container never downloads or installs anything at runtime. On first use, the service copies a component from the image into the data volume (a local copy, no network). It also starts without a key (local fallback when MinerU is unconfigured); keys can be pasted later on the Web settings page. Keys from environment variables stay in memory only and are never written to disk.
+
+The first build downloads about 6 GB from GitHub, PyPI, and Hugging Face and takes about 15–40 minutes; a plain `docker compose up -d` without `--build` does not rebuild. Building the arm64 image on an amd64 host runs the Docling install under QEMU emulation and is noticeably slower; use a native ARM build machine or a buildx remote ARM node for arm64.
 
 Multi-arch publishing (build both architectures at once and push):
 
@@ -48,6 +50,22 @@ sag parse-server --port 3002 --data-dir /path/to/data
 It listens on `0.0.0.0:3001` by default and uses the SAG data directory unless `--data-dir` is given. On start it creates `parse-uploads/`, `parse-outputs/` (with `docs/` and `temp/`), `parse.db`, and `sag.sqlite` under the data directory.
 
 There is no authentication. It is an intranet service; do not expose it directly to the public internet.
+
+## Docling components
+
+Local parsing relies on two Docling components. The Docker image installs both at build time; without Docker, install them with the CLI:
+
+```sh
+sag docling install                  # installs both the document and media components
+sag docling install --profile documents   # document component only
+sag docling install --profile media       # media component only
+sag docling install --data-dir /path/to/data  # data directory, defaults to the SAG data directory
+```
+
+- **Document component**: Python 3.12 + docling + layout, TableFormer, and RapidOCR models; html, msg, zip, and the local fallback for PDF/Office all go through it.
+- **Media component**: openai-whisper + the whisper-tiny model + a bundled ffmpeg; used when audio/video goes through Docling media.
+
+Components live under the data directory (`docling/` and `docling/media/`) and stay usable after one install. The prebuilt components in the image sit at `/opt/sag/docling-documents` and `/opt/sag/docling-media`; the service finds them through the `SAG_DOCLING_COMPONENT_DIR` / `SAG_DOCLING_MEDIA_COMPONENT_DIR` environment variables and copies them into the data directory on first use (skipped when already present). You can also point those variables at your own prebuilt component directories (they must contain `manifest.json`, a Python runtime, site-packages, and models).
 
 ## Web UI
 
@@ -123,7 +141,7 @@ The parse server only supports MinerU official (mineru.net); 302.AI has been rem
 ## Known limitations
 
 - Queue-concurrency changes apply immediately; output-directory changes only affect tasks created afterwards.
-- Formats such as html, msg, and zip are not handled by anydoc and can only go through Docling; without the Docling document component installed, those tasks fail with an explicit error.
+- Formats such as html, msg, and zip are not handled by anydoc and can only go through Docling; the Docker image ships with the Docling components, and without Docker a missing component makes those tasks fail with an explicit error — install it with `sag docling install`.
 - MinerU 429 switching happens at task granularity; a single task does not retry with another key.
 - Video tasks fail when no vision model is configured (the ASR stage still completes, and the error explains the cause).
 - Task-list `search` matches the upload path (which contains the MD5 sharded directory) and `task_id`; the original file name is not stored separately, so searching by it only matches the extension or an MD5 substring.

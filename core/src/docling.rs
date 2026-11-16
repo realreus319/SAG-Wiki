@@ -523,18 +523,33 @@ impl Docling {
     fn install(&self) -> Result<()> {
         fs::create_dir_all(&self.home)?;
         fs::write(self.home.join("install-diagnostics.log"), [])?;
+        // A programmatic component source (desktop import UI) only ever
+        // applies to the documents profile. The environment hooks below let
+        // a Docker image ship both profiles prebuilt: the server then only
+        // copies them into the data directory on first use, no downloads.
         let source = self
             .source
             .lock()
             .unwrap()
             .clone()
-            .or_else(|| std::env::var_os("SAG_DOCLING_COMPONENT_DIR").map(PathBuf::from));
-        let cancel = || self.cancel.load(Ordering::Relaxed);
-        if let Some(source) = source.filter(|_| self.profile == DoclingProfile::Documents) {
-            self.progress("dependencies", "正在校验并准备预构建文档组件…");
-            return crate::docling_component::stage(&self.home, &source, &cancel, |runtime| {
-                self.probe_component(runtime, &cancel)
+            .filter(|_| self.profile == DoclingProfile::Documents)
+            .or_else(|| {
+                let var = match self.profile {
+                    DoclingProfile::Media => "SAG_DOCLING_MEDIA_COMPONENT_DIR",
+                    DoclingProfile::Documents => "SAG_DOCLING_COMPONENT_DIR",
+                };
+                std::env::var_os(var).map(PathBuf::from)
             });
+        let cancel = || self.cancel.load(Ordering::Relaxed);
+        if let Some(source) = source {
+            self.progress("dependencies", "正在校验并准备预构建组件…");
+            return crate::docling_component::stage_for(
+                &self.home,
+                &source,
+                &cancel,
+                |runtime| self.probe_component(runtime, &cancel),
+                self.profile,
+            );
         }
         let uv = self.bootstrap_uv()?;
         self.install_online(&uv)
@@ -1526,21 +1541,28 @@ impl Docling {
         }
         let mut file = tempfile::NamedTempFile::new_in(parent)?;
         // Relative source link survives moving the whole knowledge folder.
-        let depth = output
+        // Outside a `.sag-converted` tree (e.g. the parse server's output
+        // directory) the link falls back to a file:// URL instead of
+        // failing: the header link is a convenience, not the conversion.
+        let link = match output
             .ancestors()
             .position(|path| {
                 path.file_name()
                     .is_some_and(|name| name == OUTPUT_DIRECTORY)
             })
-            .context("转换路径必须位于 .sag-converted")?;
-        let root = output.ancestors().nth(depth + 1).unwrap();
-        let link = match source.strip_prefix(root) {
-            Ok(relative) => format!("{}{}", "../".repeat(depth), relative.to_string_lossy().replace('\\', "/"))
+            .and_then(|depth| {
+                let root = output.ancestors().nth(depth + 1).unwrap();
+                source
+                    .strip_prefix(root)
+                    .ok()
+                    .map(|relative| (depth, relative))
+            }) {
+            Some((depth, relative)) => format!("{}{}", "../".repeat(depth), relative.to_string_lossy().replace('\\', "/"))
                 .bytes().map(|b| {
                     if b.is_ascii_alphanumeric() || b"-._~/".contains(&b) { (b as char).to_string() }
                     else { format!("%{b:02X}") }
                 }).collect::<String>(),
-            Err(_) => {
+            None => {
                 // Strip Windows's verbatim path prefix for file URL conversion.
                 let source = source.to_string_lossy();
                 let normal = if let Some(unc) = source.strip_prefix(r"\\?\UNC\") {

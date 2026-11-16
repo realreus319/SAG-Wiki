@@ -143,6 +143,11 @@ enum CliCommand {
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
+    /// 管理 Docling 转换组件（文档/音视频），供无界面环境与 Docker 构建期预装。
+    Docling {
+        #[command(subcommand)]
+        action: DoclingCommand,
+    },
     /// 配置检索服务。交互模式下隐藏密钥输入。
     Config(ConfigOptions),
     /// 将当前目录或指定目录加入知识库。
@@ -163,6 +168,73 @@ enum CliCommand {
 }
 #[derive(Subcommand)]
 enum ServiceCommand { Status, Stop, Restart, #[command(hide=true)] Serve { #[arg(long)] data_dir: Option<PathBuf> } }
+
+#[derive(Subcommand)]
+enum DoclingCommand {
+    /// 下载并安装 Docling 组件到数据目录。默认同时安装文档与音视频两个组件。
+    Install {
+        /// 数据目录，默认 SAG 数据目录。
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// 要安装的组件：documents、media 或 all，默认 all。
+        #[arg(long, default_value = "all", value_parser = ["documents", "media", "all"])]
+        profile: String,
+    },
+}
+
+fn run_docling_install(data_dir_opt: &Option<PathBuf>, profile: &str) -> Result<()> {
+    let data = match data_dir_opt {
+        Some(data) => data.clone(),
+        None => data_dir()?,
+    };
+    let profiles = match profile {
+        "documents" => vec![sag_protocol::DoclingProfile::Documents],
+        "media" => vec![sag_protocol::DoclingProfile::Media],
+        _ => vec![
+            sag_protocol::DoclingProfile::Documents,
+            sag_protocol::DoclingProfile::Media,
+        ],
+    };
+    let docling = Arc::new(sag_core::docling::Docling::new(&data));
+    if profiles.iter().all(|profile| docling.has_profile(*profile)) {
+        println!("Docling 组件已安装，无需重复安装。");
+        return Ok(());
+    }
+    docling.start_profiles(profiles)?;
+    let mut last_line = String::new();
+    loop {
+        let status = docling.status();
+        let mut line = format!("{}：{}", status.stage, status.message);
+        if let Some(percent) = status.percent {
+            line.push_str(&format!("（{:.0}%）", percent));
+        } else if status.packages_total > 0 {
+            line.push_str(&format!(
+                "（{}/{} 个包）",
+                status.packages_done, status.packages_total
+            ));
+        }
+        if line != last_line {
+            println!("{line}");
+            last_line = line;
+        }
+        if !status.running {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    let status = docling.status();
+    if status.stage == "done" {
+        println!("Docling 组件已准备就绪。");
+        Ok(())
+    } else {
+        bail!(
+            "{}",
+            status
+                .error
+                .unwrap_or_else(|| format!("Docling 安装失败（{}）", status.stage))
+        )
+    }
+}
 #[derive(clap::Args, Default)]
 struct ConfigOptions {
     /// 重新启用曾关闭的 CLI 接入。
@@ -266,6 +338,14 @@ fn main() {
     if let Some(CliCommand::Service { action }) = &args.command {
         let result=run_service(action);
         if let Err(error)=result {eprintln!("{error:#}");std::process::exit(1);}
+        return;
+    }
+    if let Some(CliCommand::Docling { action }) = &args.command {
+        let DoclingCommand::Install { data_dir, profile } = action;
+        if let Err(error) = run_docling_install(data_dir, profile) {
+            eprintln!("{error:#}");
+            std::process::exit(1);
+        }
         return;
     }
     if let Some(CliCommand::ParseServer { host, port, data_dir: data_dir_opt }) = &args.command {
@@ -414,7 +494,7 @@ fn run(args: Args, interrupted: Arc<Interrupt>) -> Result<i32> {
         Some(patterns)
     } else { None };
     let (command, path, json, timeout) = match args.command {
-        Some(CliCommand::Install { .. } | CliCommand::Uninstall { .. } | CliCommand::Service{..} | CliCommand::Api{..} | CliCommand::ParseServer{..}) => unreachable!(),
+        Some(CliCommand::Install { .. } | CliCommand::Uninstall { .. } | CliCommand::Service{..} | CliCommand::Api{..} | CliCommand::ParseServer{..} | CliCommand::Docling{..}) => unreachable!(),
         Some(CliCommand::Status) => (Command::Status, cwd.clone(), false, 10),
         Some(CliCommand::List { json }) => (Command::List, cwd.clone(), json, 10),
         Some(CliCommand::Check { directory, json }) => (

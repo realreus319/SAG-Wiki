@@ -193,6 +193,7 @@ pub fn verify_for(root: &Path, cancel: &dyn Fn() -> bool, profile: DoclingProfil
             }
         } else if entry.file_type().is_file()
             && relative != Path::new("manifest.json")
+            && relative != Path::new("ready")
             && !expected.contains(&relative.to_string_lossy().replace('\\', "/"))
         {
             bail!("组件包含清单外文件：{}", relative.display())
@@ -209,7 +210,22 @@ pub fn stage(
     cancel: &dyn Fn() -> bool,
     probe: impl FnOnce(&Runtime) -> Result<()>,
 ) -> Result<()> {
-    verify(source, cancel)?;
+    stage_for(home, source, cancel, probe, DoclingProfile::Documents)
+}
+
+/// Stage a prebuilt component directory (with manifest.json) for the given
+/// profile. Used by the SAG_DOCLING_COMPONENT_DIR /
+/// SAG_DOCLING_MEDIA_COMPONENT_DIR environment hooks, so a Docker image can
+/// ship both components and the server only copies them into the data
+/// directory on first use, without downloading anything.
+pub fn stage_for(
+    home: &Path,
+    source: &Path,
+    cancel: &dyn Fn() -> bool,
+    probe: impl FnOnce(&Runtime) -> Result<()>,
+    profile: DoclingProfile,
+) -> Result<()> {
+    verify_for(source, cancel, profile)?;
     let components = home.join("components");
     fs::create_dir_all(&components)?;
     if components
@@ -219,7 +235,10 @@ pub fn stage(
         bail!("组件来源不能包含安装目标目录")
     }
     let staging = tempfile::Builder::new()
-        .prefix("documents-")
+        .prefix(match profile {
+            DoclingProfile::Media => "media-",
+            DoclingProfile::Documents => "documents-",
+        })
         .tempdir_in(&components)?;
     for entry in walkdir::WalkDir::new(source).follow_links(false) {
         let entry = entry?;
@@ -265,7 +284,7 @@ pub fn stage(
             bail!("组件包含不支持的特殊文件")
         }
     }
-    activate(home, staging, cancel, probe)
+    activate_for(home, staging, cancel, probe, profile)
 }
 
 /// Hash a freshly downloaded runtime in place. The candidate never moves, so
@@ -556,6 +575,21 @@ mod tests {
         )
         .unwrap();
         candidate
+    }
+    #[test]
+    fn activated_component_with_ready_file_stages_as_prebuilt_source() {
+        // An installed component carries a `ready` file written by activate(),
+        // after the manifest was generated. Staging such a directory (the
+        // Docker prebuilt-component flow) must not reject it as an unlisted
+        // file; the manifest writer already skips `ready` when hashing.
+        let t = tempfile::tempdir().unwrap();
+        let source = t.path().join("source");
+        fixture(&source);
+        fs::write(source.join("ready"), VERSION).unwrap();
+        verify(&source, &|| false).unwrap();
+        let home = t.path().join("home");
+        stage(&home, &source, &|| false, |_| Ok(())).unwrap();
+        assert!(active(&home).is_ok());
     }
     #[test]
     fn media_activation_and_failures_are_isolated_from_document_runtime() {
