@@ -131,6 +131,18 @@ enum CliCommand {
     },
     /// 管理独立后台服务。
     Service { #[command(subcommand)] action: ServiceCommand },
+    /// 只运行文件解析服务（不启动桌面/索引监听），监听 0.0.0.0:3001，无鉴权。
+    ParseServer {
+        /// 监听地址，默认 0.0.0.0。
+        #[arg(long, default_value = "0.0.0.0")]
+        host: String,
+        /// 监听端口，默认 3001。
+        #[arg(long, default_value_t = 3001, value_parser = clap::value_parser!(u16).range(1..))]
+        port: u16,
+        /// 数据目录，默认 SAG 数据目录。
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
     /// 配置检索服务。交互模式下隐藏密钥输入。
     Config(ConfigOptions),
     /// 将当前目录或指定目录加入知识库。
@@ -256,6 +268,33 @@ fn main() {
         if let Err(error)=result {eprintln!("{error:#}");std::process::exit(1);}
         return;
     }
+    if let Some(CliCommand::ParseServer { host, port, data_dir: data_dir_opt }) = &args.command {
+        let data = match data_dir_opt {
+            Some(data) => data.clone(),
+            None => match data_dir() {
+                Ok(data) => data,
+                Err(error) => { eprintln!("{error:#}"); std::process::exit(1); }
+            },
+        };
+        let stop = tokio_util::sync::CancellationToken::new();
+        let signal = stop.clone();
+        ctrlc::set_handler(move || signal.cancel()).unwrap_or_else(|error| {
+            eprintln!("无法设置取消处理程序：{error}");
+            std::process::exit(1);
+        });
+        let runtime = match tokio::runtime::Runtime::new() {
+            Ok(runtime) => runtime,
+            Err(error) => { eprintln!("{error:#}"); std::process::exit(1); }
+        };
+        let result = runtime.block_on(sag_core::parse_server::run_parse_server(
+            data,
+            host.clone(),
+            *port,
+            stop,
+        ));
+        if let Err(error) = result { eprintln!("{error:#}"); std::process::exit(1); }
+        return;
+    }
 
     let mut filters = vec![];
     for (name, include) in [("include", true), ("exclude", false)] {
@@ -375,7 +414,7 @@ fn run(args: Args, interrupted: Arc<Interrupt>) -> Result<i32> {
         Some(patterns)
     } else { None };
     let (command, path, json, timeout) = match args.command {
-        Some(CliCommand::Install { .. } | CliCommand::Uninstall { .. } | CliCommand::Service{..} | CliCommand::Api{..}) => unreachable!(),
+        Some(CliCommand::Install { .. } | CliCommand::Uninstall { .. } | CliCommand::Service{..} | CliCommand::Api{..} | CliCommand::ParseServer{..}) => unreachable!(),
         Some(CliCommand::Status) => (Command::Status, cwd.clone(), false, 10),
         Some(CliCommand::List { json }) => (Command::List, cwd.clone(), json, 10),
         Some(CliCommand::Check { directory, json }) => (

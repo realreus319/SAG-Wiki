@@ -84,11 +84,23 @@ pub fn save_mcp_credentials(
     }
     write_credentials(dir, &values)
 }
+/// Secret kinds the credential file accepts. Besides the fixed kinds, the
+/// MinerU key pool uses per-slot kinds (`mineru:official:0`, `mineru:302:1`,
+/// …) and the vision backend uses `vision`.
+fn valid_secret_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "answer" | "jev" | "mineru:302" | "mineru:official" | "vision"
+    ) || ["mineru:302:", "mineru:official:"].iter().any(|prefix| {
+        kind.strip_prefix(prefix)
+            .is_some_and(|slot| !slot.is_empty() && slot.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
 pub fn save_secret(dir: &std::path::Path, kind: &str, key: &str) -> Result<()> {
     if key.trim().is_empty() {
         return Ok(());
     }
-    if !matches!(kind, "answer" | "jev" | "mineru:302" | "mineru:official") {
+    if !valid_secret_kind(kind) {
         bail!("模型类型不正确")
     }
     let mut values = credentials(dir)?;
@@ -96,7 +108,7 @@ pub fn save_secret(dir: &std::path::Path, kind: &str, key: &str) -> Result<()> {
     write_credentials(dir, &values)
 }
 pub fn clear_secret(dir: &std::path::Path, kind: &str) -> Result<()> {
-    if !matches!(kind, "answer" | "jev" | "mineru:302" | "mineru:official") {
+    if !valid_secret_kind(kind) {
         bail!("模型类型不正确")
     }
     let mut values = credentials(dir)?;

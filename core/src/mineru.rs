@@ -36,7 +36,28 @@ pub fn supports(source: &Path) -> bool {
 pub fn save_key(dir: &Path, config: &MineruConfig, key: &str) -> Result<()> {
     crate::models::save_secret(dir, config.provider.credential_kind(), key)
 }
+
+// Per-thread MinerU key override, used by the parse-only server's key pool:
+// the job installs the selected pool key for the duration of one
+// conversion on the worker thread, without rewriting `credentials.json`
+// (so env-injected keys are never persisted and concurrent jobs cannot
+// clobber each other's key through the single shared slot).
+thread_local! {
+    static KEY_OVERRIDE: std::cell::RefCell<Option<String>> =
+        std::cell::RefCell::new(None);
+}
+pub(crate) fn set_key_override(key: Option<String>) {
+    KEY_OVERRIDE.with(|slot| *slot.borrow_mut() = key);
+}
+pub(crate) fn clear_key_override() {
+    set_key_override(None);
+}
 pub fn key(dir: &Path, config: &MineruConfig) -> Result<String> {
+    if let Some(key) = KEY_OVERRIDE.with(|slot| slot.borrow().clone()) {
+        if !key.trim().is_empty() {
+            return Ok(key);
+        }
+    }
     crate::models::secret(dir, config.provider.credential_kind())
         .context("请在模型设置中填写当前 MinerU 服务商的 API Key")
 }

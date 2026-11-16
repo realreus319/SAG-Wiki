@@ -30,6 +30,7 @@ mod utility_tools;
 pub mod protocol;
 
 pub mod explore;
+pub mod parse_server;
 pub mod service;
 pub mod server;
 pub mod http_api;

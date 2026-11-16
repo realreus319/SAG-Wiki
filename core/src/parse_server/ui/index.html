@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>文件解析服务 · SAG-Wiki</title>
+<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">S</span>
+      <span class="brand-text">
+        <strong>文件解析服务</strong>
+        <small>parse-server · :3001</small>
+      </span>
+    </div>
+    <nav class="nav" aria-label="主导航">
+      <button type="button" data-nav="tasks" class="active">任务总览</button>
+      <button type="button" data-nav="settings">设置</button>
+      <button type="button" data-nav="logs">日志</button>
+    </nav>
+    <div class="sidebar-foot">
+      <div class="health" id="health" role="status">
+        <span class="health-dot" data-state="unknown"></span>
+        <span id="health-text">正在检查服务…</span>
+      </div>
+      <p class="sidebar-note">内网服务，无外部资源。<br>密钥只以掩码显示。</p>
+    </div>
+  </aside>
+
+  <main class="content">
+    <!-- ============ 任务总览 ============ -->
+    <section id="page-tasks" class="page">
+      <div class="page-heading">
+        <h1>任务总览</h1>
+        <p>上传文件提交解析，按设置里每种类型的首选引擎解析，失败自动降级。提交后每 2 秒刷新进度。</p>
+      </div>
+
+      <div class="settings-group upload-group">
+        <div class="dropzone" id="dropzone" tabindex="0" role="button" aria-label="选择或拖拽文件上传">
+          <p class="dropzone-title">拖拽文件到此处，或 <button type="button" class="linklike" id="pick-files">选择文件</button></p>
+          <p class="dropzone-hint">支持 PDF / Office / Markdown / 文本 / 音视频等多格式，可多选；单个文件大小受「设置 → 文件处理」上限约束。</p>
+          <input type="file" id="file-input" multiple hidden>
+          <ul class="file-picks" id="file-picks" hidden></ul>
+        </div>
+        <div class="upload-fields">
+          <label class="field-label">client_id（可选）
+            <input type="text" id="client-id" placeholder="例如 sag-desktop，留空则不记录" autocomplete="off" spellcheck="false">
+          </label>
+          <div class="upload-actions">
+            <span class="upload-status" id="upload-status" role="status"></span>
+            <button type="button" class="primary" id="upload-btn" disabled>提交解析</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="list-toolbar">
+        <div class="filters">
+          <label>状态
+            <select id="filter-status">
+              <option value="">全部</option>
+              <option value="pending">待处理</option>
+              <option value="processing">解析中</option>
+              <option value="completed">已完成</option>
+              <option value="failed">失败</option>
+            </select>
+          </label>
+          <label>client_id
+            <input type="text" id="filter-client" placeholder="按 client_id 筛选" autocomplete="off" spellcheck="false">
+          </label>
+          <label class="filter-search">搜索
+            <input type="search" id="filter-search" placeholder="文件名 / task_id" autocomplete="off" spellcheck="false">
+          </label>
+        </div>
+        <button type="button" class="outline" id="refresh-tasks">刷新</button>
+      </div>
+
+      <div id="tasks-loading" class="state-block" hidden>正在加载任务列表…</div>
+      <div id="tasks-empty" class="state-block" hidden>
+        <strong>暂无任务</strong>
+        <p>还没有提交过解析任务。把文件拖到上方上传框即可开始。</p>
+      </div>
+      <div id="tasks-error" class="state-block state-error" hidden></div>
+
+      <ul class="task-list" id="task-list"></ul>
+
+      <div class="pager" id="pager" hidden>
+        <button type="button" class="outline" id="page-prev">上一页</button>
+        <span id="page-info" role="status"></span>
+        <button type="button" class="outline" id="page-next">下一页</button>
+      </div>
+    </section>
+
+    <!-- ============ 任务详情 ============ -->
+    <section id="page-detail" class="page" hidden>
+      <div class="page-heading detail-heading">
+        <div>
+          <button type="button" class="linklike back-link" id="back-to-tasks">← 返回任务列表</button>
+          <h1 id="detail-title">任务详情</h1>
+          <p id="detail-sub" class="detail-sub"></p>
+        </div>
+        <div class="detail-actions">
+          <button type="button" class="outline" id="detail-restart">重启</button>
+          <button type="button" class="outline" id="detail-retry">重试（新 prompt）</button>
+        </div>
+      </div>
+
+      <div id="detail-loading" class="state-block" hidden>正在加载任务…</div>
+      <div id="detail-error" class="state-block state-error" hidden></div>
+
+      <div id="detail-body" hidden>
+        <div class="settings-group">
+          <div class="setting-row">
+            <div><strong>状态</strong><p id="detail-status-desc"></p></div>
+            <span class="badge" id="detail-badge"></span>
+          </div>
+          <div class="setting-row">
+            <div><strong>当前引擎</strong><p id="detail-engine-desc">按该文件类型的首选引擎解析，失败自动降级。</p></div>
+            <span class="setting-value" id="detail-engine"></span>
+          </div>
+          <div class="setting-row">
+            <div><strong>进度</strong><p id="detail-progress-desc"></p></div>
+            <span class="setting-value" id="detail-progress-text"></span>
+          </div>
+          <div class="progress-track detail-progress"><div class="progress-fill" id="detail-progress-fill"></div></div>
+        </div>
+
+        <h2 class="section-title">引擎尝试链</h2>
+        <div class="settings-group" id="attempts"></div>
+        <div id="attempts-empty" class="state-block" hidden>暂无引擎尝试记录（任务尚未开始执行）。</div>
+
+        <h2 class="section-title">调用记录</h2>
+        <div class="settings-group">
+          <div class="setting-row"><div><strong>client_id</strong><p>提交时传入的调用方标识</p></div><span class="setting-value mono" id="detail-client"></span></div>
+          <div class="setting-row"><div><strong>提交时间</strong><p>服务端收到的时间</p></div><span class="setting-value" id="detail-created"></span></div>
+          <div class="setting-row"><div><strong>耗时</strong><p>从提交到终态（或当前）的用时</p></div><span class="setting-value" id="detail-duration"></span></div>
+          <div class="setting-row"><div><strong>输入文件</strong><p>原始文件名 / 服务端路径</p></div><span class="setting-value mono" id="detail-input"></span></div>
+          <div class="setting-row"><div><strong>输出路径</strong><p>解析产物保存位置</p></div><span class="setting-value mono" id="detail-output"></span></div>
+          <div class="setting-row"><div><strong>task_id</strong><p>唯一任务标识</p></div><span class="setting-value mono" id="detail-taskid"></span></div>
+        </div>
+
+        <h2 class="section-title">解析结果</h2>
+        <div class="result-toolbar">
+          <div class="seg" role="tablist" aria-label="结果视图">
+            <button type="button" id="view-rendered" class="active" role="tab" aria-selected="true">渲染预览</button>
+            <button type="button" id="view-source" role="tab" aria-selected="false">Markdown 源码</button>
+          </div>
+          <div class="result-actions">
+            <button type="button" class="outline" id="copy-md" disabled>复制</button>
+            <button type="button" class="outline" id="download-md" disabled>下载 .md</button>
+          </div>
+        </div>
+        <div id="result-empty" class="state-block">任务完成后，这里显示解析出的 Markdown。</div>
+        <div id="result-error" class="state-block state-error" hidden></div>
+        <article class="md-preview" id="md-rendered" hidden></article>
+        <pre class="md-source" id="md-source" hidden></pre>
+
+        <div class="retry-box" id="retry-box" hidden>
+          <label class="field-label">新 prompt（用新 prompt 基于原文件重新处理，将生成新任务）
+            <input type="text" id="retry-prompt" placeholder="例如：只保留标题和正文" autocomplete="off" spellcheck="false">
+          </label>
+          <div class="retry-actions">
+            <button type="button" class="outline" id="retry-cancel">取消</button>
+            <button type="button" class="primary" id="retry-submit">用新 prompt 重新处理</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 设置 ============ -->
+    <section id="page-settings" class="page" hidden>
+      <div class="page-heading">
+        <h1>设置</h1>
+        <p>保存后即时生效。密钥只以掩码形式返回，输入框提交后立即清空，页面任何地方都不会回显明文。</p>
+      </div>
+      <div id="settings-loading" class="state-block" hidden>正在加载设置…</div>
+      <div id="settings-error" class="state-block state-error" hidden></div>
+      <div id="settings-body" hidden>
+        <div class="settings-feedback" id="settings-feedback" role="status"></div>
+
+        <h2 class="section-title">文档解析</h2>
+        <p class="section-desc">每种文件类型选一个首选引擎，失败时其余引擎仍按默认顺序降级。点「配置」打开该引擎的单独设置。</p>
+        <div class="settings-group" id="group-doc-engines"></div>
+
+        <h2 class="section-title">MinerU API Key（多 key 轮换）</h2>
+        <div class="settings-info-box">
+          <strong>密钥不会以明文返回</strong>
+          <p>列表只显示掩码（如 sk-****abcd）与每 key 的成功 / 失败 / 页数统计。新增时输入框为密码型，提交后立即清空；删除立即生效。解析服务只用 MinerU 官方（mineru.net）。</p>
+        </div>
+        <div class="settings-group" id="mineru-keys"></div>
+        <div class="settings-group key-add">
+          <label class="field-label">新增 Key（MinerU 官方密钥，明文只在此输入一次）
+            <input type="password" id="new-key-value" placeholder="粘贴 API Key，提交后立即清空" autocomplete="off" spellcheck="false">
+          </label>
+          <div class="key-add-actions">
+            <span class="upload-status" id="key-add-status" role="status"></span>
+            <button type="button" class="primary" id="add-key-btn">添加 Key</button>
+          </div>
+        </div>
+
+        <h2 class="section-title">音视频</h2>
+        <p class="section-desc">音频与视频各选一个首选引擎；ASR 与视觉模型是外部后端，点「配置」填服务地址与模型。</p>
+        <div class="settings-group" id="group-media"></div>
+        <div class="settings-info-box">
+          <strong>外部后端未验证</strong>
+          <p>FunASR / VibeVoice / OpenAI 兼容后端与视觉模型均为外部服务地址，本页面只保存配置，不做连通性验证；首次使用前请在日志页确认调用结果。</p>
+        </div>
+
+        <h2 class="section-title">队列与日志</h2>
+        <div class="settings-group" id="group-queue-logs"></div>
+
+        <div class="settings-footer">
+          <span class="settings-status" id="settings-save-status" role="status"></span>
+          <button type="button" class="primary" id="save-settings">保存设置</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 引擎配置弹窗 ============ -->
+    <div class="modal-backdrop" id="engine-modal" hidden>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="engine-modal-title">
+        <div class="modal-head">
+          <h2 id="engine-modal-title">配置引擎</h2>
+          <button type="button" class="linklike" id="engine-modal-close" aria-label="关闭">✕</button>
+        </div>
+        <div class="modal-body" id="engine-modal-body"></div>
+        <div class="modal-foot">
+          <span class="upload-status" id="engine-modal-status" role="status"></span>
+          <button type="button" class="primary" id="engine-modal-done">完成</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ 日志 ============ -->
+    <section id="page-logs" class="page" hidden>
+      <div class="page-heading">
+        <h1>日志</h1>
+        <p>服务运行日志。错误原文完整展示，不截断关键信息。</p>
+      </div>
+      <div class="list-toolbar">
+        <div class="filters">
+          <label>级别
+            <select id="log-level">
+              <option value="">全部</option>
+              <option value="INFO">INFO</option>
+              <option value="WARN">WARN</option>
+              <option value="ERROR">ERROR</option>
+            </select>
+          </label>
+          <label>task_id
+            <input type="text" id="log-task" placeholder="按 task_id 过滤" autocomplete="off" spellcheck="false">
+          </label>
+          <label class="filter-search">搜索
+            <input type="search" id="log-search" placeholder="搜索日志内容" autocomplete="off" spellcheck="false">
+          </label>
+          <label class="check-label"><input type="checkbox" id="log-autorefresh" checked> 自动刷新（5 秒）</label>
+        </div>
+        <button type="button" class="outline" id="refresh-logs">刷新</button>
+      </div>
+      <div id="logs-loading" class="state-block" hidden>正在加载日志…</div>
+      <div id="logs-empty" class="state-block" hidden>
+        <strong>暂无日志</strong>
+        <p>当前筛选条件下没有日志记录。</p>
+      </div>
+      <div id="logs-error" class="state-block state-error" hidden></div>
+      <ol class="log-list" id="log-list"></ol>
+    </section>
+  </main>
+</div>
+
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+<script src="./app.js"></script>
+</body>
+</html>

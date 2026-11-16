@@ -229,7 +229,7 @@ pub fn convert(
     cancel: impl Fn() -> bool + Sync,
     report: impl FnMut(Attempt),
 ) -> Result<()> {
-    convert_mode(source, output, docling, settings, cancel, report, false)
+    convert_mode(source, output, docling, settings, cancel, report, false, None)
 }
 
 pub fn convert_enhanced(
@@ -240,7 +240,32 @@ pub fn convert_enhanced(
     cancel: impl Fn() -> bool + Sync,
     report: impl FnMut(Attempt),
 ) -> Result<()> {
-    convert_mode(source, output, docling, settings, cancel, report, true)
+    convert_mode(source, output, docling, settings, cancel, report, true, None)
+}
+
+/// Like [`convert`], but the named engine (one of `"MinerU"`,
+/// `"anydoc"`, `"Docling"`) is tried first when the file can use it;
+/// the remaining engines still run as fallbacks in their usual order.
+/// A name that is not in the chain for this file is ignored.
+pub fn convert_with_engine(
+    source: &Path,
+    output: &Path,
+    docling: &Docling,
+    settings: &Settings,
+    cancel: impl Fn() -> bool + Sync,
+    report: impl FnMut(Attempt),
+    preferred_engine: Option<&str>,
+) -> Result<()> {
+    convert_mode(
+        source,
+        output,
+        docling,
+        settings,
+        cancel,
+        report,
+        false,
+        preferred_engine,
+    )
 }
 
 fn convert_mode(
@@ -251,6 +276,7 @@ fn convert_mode(
     cancel: impl Fn() -> bool + Sync,
     mut report: impl FnMut(Attempt),
     enhanced: bool,
+    preferred_engine: Option<&str>,
 ) -> Result<()> {
     if cancel() {
         bail!("已停止转换，未发布输出")
@@ -277,7 +303,7 @@ fn convert_mode(
                 // Docling can still repair it. Only a decision the user made
                 // (page/input limits) or a cancellation stays fatal.
                 Err(error) if preflight_falls_back(&error) => {
-                    return convert_single(source, output, docling, settings, cancel, report, None, enhanced, None);
+                    return convert_single(source, output, docling, settings, cancel, report, None, enhanced, None, preferred_engine);
                 }
                 Err(error) => return Err(error),
             };
@@ -309,12 +335,13 @@ fn convert_mode(
                         Some(part.start),
                         enhanced,
                         Some(&session),
+                        preferred_engine,
                     )
                 },
             );
         }
     }
-    convert_single(source, output, docling, settings, cancel, report, None, enhanced, None)
+    convert_single(source, output, docling, settings, cancel, report, None, enhanced, None, preferred_engine)
 }
 
 /// Whether a failed PDF segment preflight leaves the file convertible as a whole.
@@ -338,6 +365,7 @@ fn convert_single<'a>(
     original_start: Option<u32>,
     enhanced: bool,
     session: Option<&std::cell::OnceCell<crate::docling::PdfSession<'a>>>,
+    preferred_engine: Option<&str>,
 ) -> Result<()> {
     if cancel() {
         bail!("已停止转换，未发布输出")
@@ -355,6 +383,15 @@ fn convert_single<'a>(
     // Ordinary fallback parsers may load assets, so they cannot serve text-only requests.
     if !anydoc::office_text_only(source, &settings.runtime) {
         engines.push("Docling");
+    }
+    // Per-file-type preference (parse server): the chosen engine goes
+    // first when the file can use it; the rest keep their order as
+    // fallbacks. An unknown or unusable name leaves the chain alone.
+    if let Some(preferred) = preferred_engine {
+        if let Some(pos) = engines.iter().position(|e| *e == preferred) {
+            engines.remove(pos);
+            engines.insert(0, preferred);
+        }
     }
     let parent = output.parent().context("转换输出缺少父目录")?;
     fs::create_dir_all(parent)?;
@@ -646,6 +683,62 @@ printf '# recovered by alternate parser\n' > "$output"
         )
         .unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preferred_engine_moves_first_and_unusable_names_are_ignored() {
+        // Same fixture as the preflight test: chain is [anydoc, Docling].
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("repairable.pdf");
+        fs::write(&source, "PDF rejected by the splitter").unwrap();
+        docling_recovery_fixture(dir.path());
+        let output = dir.path().join(".sag-converted/repaired.md");
+        let mut attempts = vec![];
+        convert_with_engine(
+            &source,
+            &output,
+            &Docling::new(dir.path()),
+            &Settings::default(),
+            || false,
+            |a| attempts.push(a),
+            Some("Docling"),
+        )
+        .unwrap();
+        // Docling first and succeeds, so anydoc never runs.
+        assert_eq!(
+            attempts
+                .iter()
+                .filter(|a| a.phase.is_none())
+                .map(|a| a.engine.as_str())
+                .collect::<Vec<_>>(),
+            ["Docling"]
+        );
+        // A preferred engine the file cannot use leaves the chain alone.
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("repairable.pdf");
+        fs::write(&source, "PDF rejected by the splitter").unwrap();
+        docling_recovery_fixture(dir.path());
+        let output = dir.path().join(".sag-converted/repaired.md");
+        let mut attempts = vec![];
+        convert_with_engine(
+            &source,
+            &output,
+            &Docling::new(dir.path()),
+            &Settings::default(),
+            || false,
+            |a| attempts.push(a),
+            Some("MinerU"),
+        )
+        .unwrap();
+        assert_eq!(
+            attempts
+                .iter()
+                .filter(|a| a.phase.is_none())
+                .map(|a| a.engine.as_str())
+                .collect::<Vec<_>>(),
+            ["anydoc", "Docling"]
+        );
     }
 
     #[cfg(unix)]

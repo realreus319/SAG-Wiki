@@ -1,0 +1,129 @@
+---
+title: "文件解析服务"
+description: "用 sag parse-server 把文件解析成 Markdown：HTTP API、Web UI 与 MinerU 多 Key 配置。"
+---
+
+## 功能
+
+文件解析服务是独立的 HTTP 服务，只做文件解析，不启动桌面端与索引监听。上传文件后返回 Markdown，支持 PDF、Office 文档、纯文本、Markdown、电子书与音视频。
+
+解析按以下顺序自动尝试，某一步失败后降级到下一步，错误原文会保留在任务记录里：
+
+1. PDF 与图片：MinerU 云端解析（需配置 Key，未配置或失败时跳过）。
+2. Office 与文本类格式：本地 anydoc 解析。
+3. 兜底：Docling 解析。
+4. 纯文本（txt、md、markdown、rst、json、xml）不走转换链，直接读入原文（桌面端也是直接读文本，不经过转换引擎），不依赖任何组件。
+5. 音视频：先走 Docling media，失败再用 ffmpeg 抽音 + ASR；视频还需要配置视觉模型才能生成时间线总结，否则任务失败并在错误中说明原因。
+
+任务按文件内容 MD5 去重：同一文件重复提交直接返回已有任务，不重复解析。提交时可带 `client_id`，用于在任务列表与日志中区分调用方。
+
+## Docker 部署
+
+一键部署（支持 x86_64 与 ARM64，镜像构建时按宿主机架构自动选择）：
+
+```sh
+cp .env.example .env   # 可选：填 SAG_MINERU_API_KEYS，多个 key 用逗号分隔
+docker compose up -d --build
+```
+
+启动后打开 `http://127.0.0.1:3001/ui/`。数据存在具名卷 `sag-parse-data` 里；想用本地目录挂载时，把 `docker-compose.yml` 里的 `volumes` 改成 `./data:/data`。
+
+不填 key 也能启动（MinerU 未配置时走本地降级），key 也可在 Web 设置页里粘贴。环境变量里的 key 只驻留内存，不写入磁盘。
+
+多架构发布（一次构建两个架构并推送）：
+
+```sh
+docker buildx build --platform linux/amd64,linux/arm64 -t <镜像名>:<标签> --push .
+```
+
+注意：若宿主机设置了 `HTTP(S)_PROXY`，MinerU 请求被代理时可能超时；`docker-compose.yml` 已把 MinerU 相关域名写进 `NO_PROXY` 做直连。
+
+## 启动
+
+```sh
+sag parse-server
+sag parse-server --port 3002 --data-dir /path/to/data
+```
+
+默认监听 `0.0.0.0:3001`，数据目录默认为 SAG 数据目录。服务启动后在数据目录下生成 `parse-uploads/`、`parse-outputs/`（内含 `docs/` 与 `temp/`）、`parse.db` 与 `sag.sqlite`。
+
+服务无鉴权，仅供内网使用，不要直接暴露到公网。
+
+## Web UI
+
+浏览器打开 `http://127.0.0.1:3001/` 或 `http://127.0.0.1:3001/ui/`，即可使用 Web UI：
+
+- **任务总览**：拖拽或选择文件上传（可多选），填写 `client_id`；查看任务状态、进度、当前引擎与耗时；取消或重启任务。上传表单没有 prompt（SAG 桌面原来也没有）；prompt 只在任务详情「重试（新 prompt）」与 `/convert` 的 `task_id` 重跑模式里用。
+- **任务详情**：引擎尝试链（每步耗时与错误原文）、PDF 分段进度、Markdown 渲染预览与源码切换、复制与下载。
+- **设置**：按文件类型选首选引擎（文档解析）、MinerU 多 Key、音视频、队列与日志；每个引擎点「配置」打开单独的设置表，保存后即时生效。
+- **日志**：按级别与任务筛选的结构化日志。
+
+## 支持的格式
+
+| 类型 | 扩展名 | 引擎 |
+| --- | --- | --- |
+| PDF | pdf | 按类型首选引擎（默认 MinerU → anydoc → Docling） |
+| 图片 | png、jpg 等 | 按类型首选引擎（默认 MinerU → Docling） |
+| Office | doc、docx、ppt、pptx、xls、xlsx、rtf、odt、html、csv、epub 等 | 按类型首选引擎（默认 anydoc → Docling） |
+| 纯文本 | txt、md、markdown、rst、json、xml | 直读原文（text），不走转换链 |
+| 音频 | wav、mp3、flac、m4a、ogg、opus、webm | 首选 Docling media 或 ASR 直转；Docling media 失败后走 ffmpeg + ASR |
+| 视频 | mp4、mov、avi、mkv | 首选 Docling media 或时间线总结（ASR + 视觉模型） |
+
+不支持的格式会在提交时按文件返回错误，不影响其他文件。
+
+## API
+
+基础地址为 `http://127.0.0.1:3001`，请求与响应均为 JSON（上传接口为 `multipart/form-data`）。所有提交接口同时接受表单字段 `client_id` 与请求头 `X-Client-Id`，表单优先，`client_id` 会存进任务记录与日志。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/health` | 服务状态与各状态任务计数 |
+| POST | `/convert` | 上传 `files[]` 提交解析，或用 `task_id` + `prompt` 重跑；返回每文件的 `task_id` 与状态 |
+| POST | `/tasks` | 表单提交已上传文件：`input_file`（uploads 下相对路径，必填）、`output_file`、`task_id`、`client_id` |
+| GET | `/tasks/{id}` | 任务记录，含尝试链、进度与耗时 |
+| GET | `/api/tasks?status=&client_id=&search=&page=&page_size=` | 任务列表，按创建时间倒序；支持按状态、`client_id` 筛选与按文件路径/`task_id` 搜索，`page_size` 默认 20、上限 100 |
+| GET | `/tasks/{id}/result` | 完成后返回内联 `markdown`；进行中返回状态；失败返回 500 与错误原文 |
+| POST | `/tasks/{id}/restart` | 仅 failed/completed 可重启 |
+| POST | `/tasks/{id}/cancel` | pending 直接取消；processing 置取消标志，任务结束为失败 |
+| GET | `/uploads/...` | 只读，供外部 ASR/视觉后端按 URL 取文件 |
+| GET/PUT | `/api/settings` | mineru、engines、docling、files、queue、asr、vision、logs 八组设置；PUT 接受部分合并，保存后新任务即时生效 |
+| GET | `/api/settings/mineru-keys` | MinerU Key 列表，只返回掩码与统计 |
+| POST | `/api/settings/mineru-keys` | 新增 Key 到下一空闲槽位 |
+| DELETE | `/api/settings/mineru-keys/{index}` | 删除指定槽位的 Key |
+| GET | `/api/logs?level=&task_id=&limit=` | 结构化日志，默认 100 条，上限 1000 条 |
+
+提交示例：
+
+```sh
+curl -F "files=@report.pdf" -F "client_id=my-app" http://127.0.0.1:3001/convert
+curl http://127.0.0.1:3001/tasks/<task_id>/result
+```
+
+## MinerU 多 Key 配置
+
+解析服务只支持 MinerU 官方（mineru.net），302.AI 已移除：设置页不再提供 302 选项，`PUT /api/settings` 与新增 Key 接口收到 `302` 会直接报 400；桌面端若配了 302，解析服务仍走官方（需在解析服务里另配官方 Key）。Key 按槽位保存在凭据文件中，设置接口与日志只返回掩码（如 `****后 4 位`），永不返回明文。
+
+- 在 Web UI 设置页新增 Key，或调用 `POST /api/settings/mineru-keys`。
+- 也可以用环境变量 `SAG_MINERU_API_KEYS`（逗号分隔）注入 Key，只驻留内存，不写入磁盘。
+- 多个 Key 按轮询分配；某个 Key 遇到 429 或额度类错误后进入冷却（默认 60 秒，可在设置中调整），冷却期间自动使用其他 Key。
+- 每个 Key 的成功、失败与页数单独统计，可在设置页或 `GET /api/settings/mineru-keys` 查看。
+- MinerU 失败不阻断任务：失败后自动降级到本地解析；429 切换体现在下一个任务选用另一 Key。
+
+## 设置说明
+
+- **每种类型选首选引擎**：PDF、Office 文档、图片各选一个首选引擎（自动 / MinerU / anydoc / Docling，图片没有 anydoc）；选中的引擎先试，失败后其余引擎仍按默认顺序降级。音频可选 Docling media 或 ASR 直转，视频可选 Docling media 或时间线总结（ASR + 视觉模型）。
+- **每个引擎单独配置**：点「配置」打开该引擎的设置表——MinerU（开关、模型、解析方式、OCR/表格/公式、超时与并发）、anydoc（Office 仅提取文字、大小上限）、Docling（超时、线程、OCR/表格）、ASR（引擎、服务地址、模型、超时与切片）、视觉模型（服务地址、模型、Key、系统提示词）。
+- **队列并发**：默认 4，可在 1–16 之间调整，改动对新启动的任务即时生效。
+- **MinerU 并发**：云端并发默认 2，可在 1–16 之间调整。
+- **MinerU 开关**：设置里的 MinerU 开关分三态——未显式设置时自动启用（Key 池或桌面凭据里有 Key 即启用）；显式打开/关闭后按选择执行，`false` 时即使有 Key 也不调 MinerU。
+- **ASR**：支持 FunASR、OpenAI 兼容接口与 VibeVoice 三种引擎，长录音按静音或等分切片，单段上限 25 MiB。
+- **视觉模型**：OpenAI 兼容的 `/v1/chat/completions` 接口，用于视频时间线总结；未配置时视频任务失败，纯音频任务不受影响。
+- **日志保留**：默认 30 天，保存设置时清理过期日志。
+
+## 已知限制
+
+- 队列并发改动即时生效；输出目录改动只影响之后创建的任务。
+- html、msg、zip 等格式 anydoc 不处理，只能走 Docling；未安装 Docling 文档组件时这类任务会失败并在错误中说明原因。
+- MinerU 的 429 切换发生在任务粒度，同一任务内不重试另一 Key。
+- 视频任务在视觉模型未配置时失败（ASR 阶段已完成，错误原文会说明原因）。
+- 任务列表的 `search` 按上传路径（含 MD5 分层目录）与 `task_id` 匹配，原始文件名未单独保存，按原文件名搜索只能命中扩展名或 MD5 子串。

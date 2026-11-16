@@ -296,6 +296,8 @@ pub enum DocumentParser {
 pub struct Settings {
     pub runtime: crate::runtime::RuntimeSettings,
     pub mineru: crate::mineru::MineruConfig,
+    /// Parse-only server settings (queue, ASR, vision, log retention).
+    pub parse: crate::parse_settings::ParseServerSettings,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub document_parser: Option<DocumentParser>,
     pub updates: UpdateSettings,
@@ -339,6 +341,7 @@ impl Default for Settings {
         Self {
             runtime: crate::runtime::RuntimeSettings::default(),
             mineru: crate::mineru::MineruConfig::default(),
+            parse: crate::parse_settings::ParseServerSettings::default(),
             document_parser: None,
             updates: UpdateSettings::default(),
             convert_other_formats: false,

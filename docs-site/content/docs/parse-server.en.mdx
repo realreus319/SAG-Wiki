@@ -1,0 +1,129 @@
+---
+title: "Parse Server"
+description: "Run sag parse-server to convert files to Markdown: HTTP API, Web UI, and MinerU multi-key setup."
+---
+
+## What it does
+
+The parse server is a standalone HTTP service that only converts files. It does not start the desktop app or the index watcher. Upload a file and get Markdown back. PDF, Office documents, plain text, Markdown, ebooks, audio, and video are supported.
+
+Conversion tries the following steps in order and falls back to the next one on failure. The original error text is kept in the task record:
+
+1. PDF and images: MinerU cloud parsing (needs a key; skipped when unconfigured or on failure).
+2. Office and text formats: local anydoc parsing.
+3. Fallback: Docling parsing.
+4. Plain text (txt, md, markdown, rst, json, xml) never enters the conversion chain: it is read in as-is (the desktop app also reads text directly, never through a conversion engine) and needs no component.
+5. Audio/video: Docling media first, then ffmpeg audio extraction + ASR; video also needs a vision model for a timeline summary, otherwise the task fails with an explicit error.
+
+Tasks are deduplicated by file-content MD5: resubmitting the same file returns the existing task instead of parsing again. You can pass a `client_id` when submitting, so tasks and logs can be attributed to a caller.
+
+## Docker deployment
+
+One-command deployment (x86_64 and ARM64 supported; the image builds for the host architecture automatically):
+
+```sh
+cp .env.example .env   # optional: set SAG_MINERU_API_KEYS, comma-separated for multiple keys
+docker compose up -d --build
+```
+
+Then open `http://127.0.0.1:3001/ui/`. Data lives in the named volume `sag-parse-data`; to use a local directory instead, change `volumes` in `docker-compose.yml` to `./data:/data`.
+
+It also starts without a key (local fallback when MinerU is unconfigured); keys can be pasted later on the Web settings page. Keys from environment variables stay in memory only and are never written to disk.
+
+Multi-arch publishing (build both architectures at once and push):
+
+```sh
+docker buildx build --platform linux/amd64,linux/arm64 -t <image>:<tag> --push .
+```
+
+Note: if the host sets `HTTP(S)_PROXY`, MinerU requests through the proxy may time out; `docker-compose.yml` already puts the MinerU domains in `NO_PROXY` so they connect directly.
+
+## Starting it
+
+```sh
+sag parse-server
+sag parse-server --port 3002 --data-dir /path/to/data
+```
+
+It listens on `0.0.0.0:3001` by default and uses the SAG data directory unless `--data-dir` is given. On start it creates `parse-uploads/`, `parse-outputs/` (with `docs/` and `temp/`), `parse.db`, and `sag.sqlite` under the data directory.
+
+There is no authentication. It is an intranet service; do not expose it directly to the public internet.
+
+## Web UI
+
+Open `http://127.0.0.1:3001/` or `http://127.0.0.1:3001/ui/` in a browser:
+
+- **Tasks**: drag-and-drop or select files to upload (multiple allowed), with an optional `client_id`; see task status, progress, current engine, and elapsed time; cancel or restart tasks. There is no prompt field on the upload form (the SAG desktop never had one either); `prompt` only exists in the task-detail "retry with a new prompt" action and in the `/convert` `task_id` re-run mode.
+- **Task detail**: the engine attempt chain (duration and original error per step), PDF segment progress, rendered Markdown preview with a source view, copy, and download.
+- **Settings**: pick a preferred engine per file type (documents), MinerU multi-key setup, audio/video, and queue/logs. Each engine has its own configuration dialog behind a "Configure" button; changes apply immediately.
+- **Logs**: structured logs filterable by level and task.
+
+## Supported formats
+
+| Type | Extensions | Engines |
+| --- | --- | --- |
+| PDF | pdf | Preferred engine per type (default MinerU → anydoc → Docling) |
+| Images | png, jpg, and others | Preferred engine per type (default MinerU → Docling) |
+| Office | doc, docx, ppt, pptx, xls, xlsx, rtf, odt, html, csv, epub, and others | Preferred engine per type (default anydoc → Docling) |
+| Plain text | txt, md, markdown, rst, json, xml | Read in as-is (`text` engine), no conversion chain |
+| Audio | wav, mp3, flac, m4a, ogg, opus, webm | Docling media first or direct ASR; on Docling media failure, ffmpeg + ASR |
+| Video | mp4, mov, avi, mkv | Docling media first or timeline summary (ASR + vision model) |
+
+An unsupported format is reported as a per-file error on submit and does not affect other files.
+
+## API
+
+The base URL is `http://127.0.0.1:3001`. Requests and responses are JSON, except uploads, which use `multipart/form-data`. Every submit endpoint accepts `client_id` both as a form field and as the `X-Client-Id` header; the form field wins, and the value is stored on the task record and in logs.
+
+| Method | Path | Description |
+| --- | --- | --- |
+| GET | `/health` | Service status and per-status task counts |
+| POST | `/convert` | Upload `files[]` to parse, or re-run with `task_id` + `prompt`; returns a `task_id` and status per file |
+| POST | `/tasks` | Submit an already-uploaded file: `input_file` (relative path under uploads, required), `output_file`, `task_id`, `client_id` |
+| GET | `/tasks/{id}` | Task record, including the attempt chain, progress, and elapsed time |
+| GET | `/api/tasks?status=&client_id=&search=&page=&page_size=` | Task list, newest first; filter by status and `client_id`, search by file path or `task_id`; `page_size` defaults to 20, max 100 |
+| GET | `/tasks/{id}/result` | Returns inline `markdown` when completed; the status while pending/processing; HTTP 500 with the original error on failure |
+| POST | `/tasks/{id}/restart` | Only failed/completed tasks can be restarted |
+| POST | `/tasks/{id}/cancel` | Pending tasks are cancelled immediately; processing tasks get a cancel flag and finish as failed |
+| GET | `/uploads/...` | Read-only, so external ASR/vision backends can fetch a file by URL |
+| GET/PUT | `/api/settings` | Eight settings groups: mineru, engines, docling, files, queue, asr, vision, logs; PUT accepts a partial merge and applies to new tasks immediately |
+| GET | `/api/settings/mineru-keys` | MinerU key list, masked values and statistics only |
+| POST | `/api/settings/mineru-keys` | Add a key to the next free slot |
+| DELETE | `/api/settings/mineru-keys/{index}` | Delete the key in a slot |
+| GET | `/api/logs?level=&task_id=&limit=` | Structured logs, 100 by default, up to 1000 |
+
+Example:
+
+```sh
+curl -F "files=@report.pdf" -F "client_id=my-app" http://127.0.0.1:3001/convert
+curl http://127.0.0.1:3001/tasks/<task_id>/result
+```
+
+## MinerU multi-key setup
+
+The parse server only supports MinerU official (mineru.net); 302.AI has been removed: the settings page no longer offers it, and `PUT /api/settings` and the add-key endpoint return HTTP 400 for `302`. If the desktop is configured with 302, the parse server still uses official (configure an official key in the parse server separately). Keys are stored per slot in the credentials file; the settings API and logs only ever return masked values (for example `****` plus the last 4 characters), never plaintext.
+
+- Add a key on the settings page of the Web UI, or call `POST /api/settings/mineru-keys`.
+- Keys can also be injected with the `SAG_MINERU_API_KEYS` environment variable (comma-separated). These stay in memory only and are never written to disk.
+- Multiple keys are used round-robin. A key that hits a 429 or quota error is cooled down (60 seconds by default, configurable) and other keys keep working.
+- Success, failure, and page counts are tracked per key and visible on the settings page or via `GET /api/settings/mineru-keys`.
+- A MinerU failure does not block the task: conversion falls back to local parsing, and the 429 switch shows up on the next task picking another key.
+
+## Settings
+
+- **Preferred engine per file type**: PDF, Office documents, and images each pick a preferred engine (auto / MinerU / anydoc / Docling; images have no anydoc). The chosen engine runs first and the others still fall back in their default order on failure. Audio can prefer Docling media or direct ASR; video can prefer Docling media or the timeline summary (ASR + vision model).
+- **One configuration dialog per engine**: click "Configure" to open that engine's own settings — MinerU (switch, model, parse method, OCR/table/formula, timeouts and concurrency), anydoc (Office text-only, size caps), Docling (timeout, threads, OCR/table), ASR (engine, base URL, model, timeouts and chunking), vision model (base URL, model, key, system prompt).
+- **Queue concurrency**: 4 by default, adjustable from 1 to 16, effective for newly started tasks immediately.
+- **MinerU concurrency**: cloud concurrency, 2 by default, adjustable from 1 to 16.
+- **MinerU switch**: three states — unset means automatic (enabled when a key exists in the key pool or the desktop credential store); an explicit on/off is honored as set, and explicit off never calls MinerU even with a key present.
+- **ASR**: FunASR, OpenAI-compatible endpoints, and VibeVoice. Long recordings are split at silence or evenly, with a 25 MiB per-segment cap.
+- **Vision model**: an OpenAI-compatible `/v1/chat/completions` endpoint for video timeline summaries. Video tasks fail without it; audio-only tasks are unaffected.
+- **Log retention**: 30 days by default; expired logs are pruned when settings are saved.
+
+## Known limitations
+
+- Queue-concurrency changes apply immediately; output-directory changes only affect tasks created afterwards.
+- Formats such as html, msg, and zip are not handled by anydoc and can only go through Docling; without the Docling document component installed, those tasks fail with an explicit error.
+- MinerU 429 switching happens at task granularity; a single task does not retry with another key.
+- Video tasks fail when no vision model is configured (the ASR stage still completes, and the error explains the cause).
+- Task-list `search` matches the upload path (which contains the MD5 sharded directory) and `task_id`; the original file name is not stored separately, so searching by it only matches the extension or an MD5 substring.
