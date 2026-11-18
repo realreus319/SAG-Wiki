@@ -1,0 +1,16 @@
+# Build the large Docling runtime image separately and only when its pinned
+# dependencies or installer change. Application source updates reuse this image.
+services:
+  docling-base:
+    image: "${SAG_RUNTIME_BASE_IMAGE:-sag-parse-server-base:a801f28}"
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime-base
+      args:
+        HF_ENDPOINT: "${HF_ENDPOINT:-https://hf-mirror.net}"
+        PIP_INDEX_URL: "${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+        UV_PYTHON_INSTALL_MIRROR: "${UV_PYTHON_INSTALL_MIRROR:-https://registry.npmmirror.com/-/binary/python-build-standalone}"
+        UV_DEFAULT_INDEX: "${UV_DEFAULT_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+        SAG_TORCH_CPU_INDEX_URL: "${SAG_TORCH_CPU_INDEX_URL:-https://mirror.sjtu.edu.cn/pytorch-wheels/cpu}"
+        SAG_CARGO_REGISTRY_MIRROR: "${SAG_CARGO_REGISTRY_MIRROR:-sparse+https://rsproxy.cn/index/}"

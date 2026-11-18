@@ -22,20 +22,24 @@ description: "用 sag parse-server 把文件解析成 Markdown：HTTP API、Web 
 一键部署（支持 x86_64 与 ARM64，镜像构建时按宿主机架构自动选择）：
 
 ```sh
-cp .env.example .env   # 可选：填 SAG_MINERU_API_KEYS，多个 key 用逗号分隔
+cp .env.example .env   # 可选：填 SAG_MINERU_API_KEYS，多个 key 用逗号分隔；HF_ENDPOINT 默认是国内源
+docker compose -f docker-compose.docling-base.yml build
 docker compose up -d --build
 ```
 
-启动后打开 `http://127.0.0.1:3001/ui/`。数据存在具名卷 `sag-parse-data` 里；想用本地目录挂载时，把 `docker-compose.yml` 里的 `volumes` 改成 `./data:/data`。
+启动后打开 `http://127.0.0.1:8005/ui/`。Docker 默认把宿主机 8005 映射到容器内 3001；可通过 `.env` 中的 `PORT` 修改宿主机端口。数据存在具名卷 `sag-parse-data` 里；想用本地目录挂载时，把 `docker-compose.yml` 里的 `volumes` 改成 `./data:/data`。
 
-镜像自带全部本地解析依赖，开箱即用：Docling 文档组件与音视频组件都在构建期装好了（见下节），容器内不再下载安装；首次使用组件时服务把它从镜像复制进数据卷（本地复制，不联网）。不填 key 也能启动（MinerU 未配置时走本地降级），key 也可在 Web 设置页里粘贴。环境变量里的 key 只驻留内存，不写入磁盘。
+Docling 文档组件与音视频组件放在单独版本化的基础镜像 `sag-parse-server-base:a801f28` 中。第一次部署时先构建基础镜像；Rust crates 默认使用 `rsproxy.cn`，uv 和 Python 依赖使用清华 PyPI 镜像，Python 运行时使用 npmmirror，PyTorch CPU wheel 使用上海交大镜像，HuggingFace 模型使用 `https://hf-mirror.net`。uv 从 PyPI 镜像预装，避免构建时依赖 GitHub Release。可在 `.env` 中覆盖这些地址。基础镜像构建成功后，普通源码更新只构建应用镜像，不会重新安装或下载 Docling 组件。容器首次启动时，入口脚本先将组件从镜像复制进数据卷（本地复制，不联网），复制完成后才启动 API；健康检查为首次复制预留 30 分钟。
 
-首次构建要从 GitHub / PyPI / HuggingFace 下载约 6GB，耗时约 15–40 分钟；日常 `docker compose up -d` 不带 `--build` 不会重建。amd64 宿主机上构建 arm64 镜像会走 QEMU 模拟，Docling 安装步骤明显更慢，arm64 建议用原生 ARM 构建机或 buildx 远程 ARM 节点。
+不填 MinerU key 也能启动（MinerU 未配置时走本地降级），key 也可在 Web 设置页里粘贴。环境变量里的 key 只驻留内存，不写入磁盘。
+
+基础镜像约 6GB，首次构建约 15–40 分钟。后续升级 Docling 安装流程或依赖时，更换 `.env` 中的 `SAG_RUNTIME_BASE_IMAGE` 标签，再构建基础镜像并重建应用镜像。amd64 宿主机上构建 arm64 基础镜像会走 QEMU 模拟，安装步骤明显更慢；arm64 建议用原生 ARM 构建机或 buildx 远程 ARM 节点。
 
 多架构发布（一次构建两个架构并推送）：
 
 ```sh
-docker buildx build --platform linux/amd64,linux/arm64 -t <镜像名>:<标签> --push .
+docker buildx build --platform linux/amd64,linux/arm64 --target runtime-base --build-arg HF_ENDPOINT=https://hf-mirror.net -t <基础镜像>:<标签> --push .
+docker buildx build --platform linux/amd64,linux/arm64 --build-arg SAG_RUNTIME_BASE_IMAGE=<基础镜像>:<标签> -t <应用镜像>:<标签> --push .
 ```
 
 注意：若宿主机设置了 `HTTP(S)_PROXY`，MinerU 请求被代理时可能超时；`docker-compose.yml` 已把 MinerU 相关域名写进 `NO_PROXY` 做直连。
@@ -65,11 +69,11 @@ sag docling install --data-dir /path/to/data  # 指定数据目录，默认 SAG 
 - **文档组件**：Python 3.12 + docling + 布局、TableFormer、RapidOCR 模型；html、msg、zip 等格式与 PDF/Office 的本地降级都靠它。
 - **音视频组件**：openai-whisper + whisper-tiny 模型 + 内置 ffmpeg；音视频走 Docling media 时用它。
 
-组件装在数据目录下（`docling/` 与 `docling/media/`），一次安装后一直可用。镜像里预装的组件在 `/opt/sag/docling-documents` 与 `/opt/sag/docling-media`，服务通过环境变量 `SAG_DOCLING_COMPONENT_DIR` / `SAG_DOCLING_MEDIA_COMPONENT_DIR` 找到它们，首次使用时复制进数据目录；组件已在数据目录里时不再复制。自己预构建组件目录也可以用这两个环境变量指过去（目录里须有 `manifest.json`、Python、site-packages 与模型）。
+组件装在数据目录下（`docling/` 与 `docling/media/`），一次安装后一直可用。基础镜像里预装的组件在 `/opt/sag/docling-documents` 与 `/opt/sag/docling-media`；Docker 入口脚本在 API 启动前调用 `sag docling install`，将组件复制进数据目录。已有组件时不会重复复制。自己预构建组件目录也可以用 `SAG_DOCLING_COMPONENT_DIR` / `SAG_DOCLING_MEDIA_COMPONENT_DIR` 指向（目录里须有 `manifest.json`、Python、site-packages 与模型）。
 
 ## Web UI
 
-浏览器打开 `http://127.0.0.1:3001/` 或 `http://127.0.0.1:3001/ui/`，即可使用 Web UI：
+Docker 默认部署时，浏览器打开 `http://127.0.0.1:8005/` 或 `http://127.0.0.1:8005/ui/`，即可使用 Web UI：
 
 - **任务总览**：拖拽或选择文件上传（可多选），填写 `client_id`；查看任务状态、进度、当前引擎与耗时；取消或重启任务。上传表单没有 prompt（SAG 桌面原来也没有）；prompt 只在任务详情「重试（新 prompt）」与 `/convert` 的 `task_id` 重跑模式里用。
 - **任务详情**：引擎尝试链（每步耗时与错误原文）、PDF 分段进度、Markdown 渲染预览与源码切换、复制与下载。
@@ -91,7 +95,7 @@ sag docling install --data-dir /path/to/data  # 指定数据目录，默认 SAG 
 
 ## API
 
-基础地址为 `http://127.0.0.1:3001`，请求与响应均为 JSON（上传接口为 `multipart/form-data`）。所有提交接口同时接受表单字段 `client_id` 与请求头 `X-Client-Id`，表单优先，`client_id` 会存进任务记录与日志。
+Docker 默认部署的基础地址为 `http://127.0.0.1:8005`（容器内仍监听 3001）；直接运行 `sag parse-server` 时默认基础地址为 `http://127.0.0.1:3001`。请求与响应均为 JSON（上传接口为 `multipart/form-data`）。所有提交接口同时接受表单字段 `client_id` 与请求头 `X-Client-Id`，表单优先，`client_id` 会存进任务记录与日志。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -113,8 +117,8 @@ sag docling install --data-dir /path/to/data  # 指定数据目录，默认 SAG 
 提交示例：
 
 ```sh
-curl -F "files=@report.pdf" -F "client_id=my-app" http://127.0.0.1:3001/convert
-curl http://127.0.0.1:3001/tasks/<task_id>/result
+curl -F "files=@report.pdf" -F "client_id=my-app" http://127.0.0.1:8005/convert
+curl http://127.0.0.1:8005/tasks/<task_id>/result
 ```
 
 ## MinerU 多 Key 配置

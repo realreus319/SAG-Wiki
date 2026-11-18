@@ -22,20 +22,22 @@ Tasks are deduplicated by file-content MD5: resubmitting the same file returns t
 One-command deployment (x86_64 and ARM64 supported; the image builds for the host architecture automatically):
 
 ```sh
-cp .env.example .env   # optional: set SAG_MINERU_API_KEYS, comma-separated for multiple keys
+cp .env.example .env   # optional: set SAG_MINERU_API_KEYS; HF_ENDPOINT defaults to the China mirror
+docker compose -f docker-compose.docling-base.yml build
 docker compose up -d --build
 ```
 
-Then open `http://127.0.0.1:3001/ui/`. Data lives in the named volume `sag-parse-data`; to use a local directory instead, change `volumes` in `docker-compose.yml` to `./data:/data`.
+Then open `http://127.0.0.1:8005/ui/`. Docker maps host port 8005 to container port 3001 by default; change `PORT` in `.env` to use another host port. Data lives in the named volume `sag-parse-data`; to use a local directory instead, change `volumes` in `docker-compose.yml` to `./data:/data`.
 
-The image ships with all local parsing dependencies, ready to use: both the Docling document component and the media component are installed at build time (see below), so the container never downloads or installs anything at runtime. On first use, the service copies a component from the image into the data volume (a local copy, no network). It also starts without a key (local fallback when MinerU is unconfigured); keys can be pasted later on the Web settings page. Keys from environment variables stay in memory only and are never written to disk.
+The Docling document and media components live in a separately versioned base image, `sag-parse-server-base:a801f28`. Build this base image for the first deployment. Rust crates use `rsproxy.cn`, uv and Python packages use the Tsinghua PyPI mirror, the Python runtime uses npmmirror, PyTorch CPU wheels use the Shanghai Jiao Tong University mirror, and Hugging Face models use `https://hf-mirror.net`. uv is preinstalled from PyPI so the build does not need a GitHub release download. Override these endpoints in `.env` as needed. Afterward, normal source updates rebuild only the application image and do not reinstall or download Docling. On the first container start, the entrypoint copies the components from the image into the data volume locally, then starts the API. The health check allows 30 minutes for this initial copy.
 
-The first build downloads about 6 GB from GitHub, PyPI, and Hugging Face and takes about 15–40 minutes; a plain `docker compose up -d` without `--build` does not rebuild. Building the arm64 image on an amd64 host runs the Docling install under QEMU emulation and is noticeably slower; use a native ARM build machine or a buildx remote ARM node for arm64.
+The base image is about 6 GB and the first build takes about 15–40 minutes. When the Docling installer or dependencies change, update `SAG_RUNTIME_BASE_IMAGE` in `.env`, rebuild the base image, then rebuild the application image. Building an arm64 base image on an amd64 host runs the Docling install under QEMU emulation and is noticeably slower; use a native ARM build machine or a buildx remote ARM node for arm64.
 
 Multi-arch publishing (build both architectures at once and push):
 
 ```sh
-docker buildx build --platform linux/amd64,linux/arm64 -t <image>:<tag> --push .
+docker buildx build --platform linux/amd64,linux/arm64 --target runtime-base --build-arg HF_ENDPOINT=https://hf-mirror.net -t <base-image>:<tag> --push .
+docker buildx build --platform linux/amd64,linux/arm64 --build-arg SAG_RUNTIME_BASE_IMAGE=<base-image>:<tag> -t <app-image>:<tag> --push .
 ```
 
 Note: if the host sets `HTTP(S)_PROXY`, MinerU requests through the proxy may time out; `docker-compose.yml` already puts the MinerU domains in `NO_PROXY` so they connect directly.
@@ -65,11 +67,11 @@ sag docling install --data-dir /path/to/data  # data directory, defaults to the 
 - **Document component**: Python 3.12 + docling + layout, TableFormer, and RapidOCR models; html, msg, zip, and the local fallback for PDF/Office all go through it.
 - **Media component**: openai-whisper + the whisper-tiny model + a bundled ffmpeg; used when audio/video goes through Docling media.
 
-Components live under the data directory (`docling/` and `docling/media/`) and stay usable after one install. The prebuilt components in the image sit at `/opt/sag/docling-documents` and `/opt/sag/docling-media`; the service finds them through the `SAG_DOCLING_COMPONENT_DIR` / `SAG_DOCLING_MEDIA_COMPONENT_DIR` environment variables and copies them into the data directory on first use (skipped when already present). You can also point those variables at your own prebuilt component directories (they must contain `manifest.json`, a Python runtime, site-packages, and models).
+Components live under the data directory (`docling/` and `docling/media/`) and stay usable after one install. The prebuilt components in the base image sit at `/opt/sag/docling-documents` and `/opt/sag/docling-media`. The Docker entrypoint runs `sag docling install` before the API starts to copy them into the data directory locally; existing components are not copied again. You can also point `SAG_DOCLING_COMPONENT_DIR` / `SAG_DOCLING_MEDIA_COMPONENT_DIR` at your own prebuilt component directories (they must contain `manifest.json`, a Python runtime, site-packages, and models).
 
 ## Web UI
 
-Open `http://127.0.0.1:3001/` or `http://127.0.0.1:3001/ui/` in a browser:
+For the default Docker deployment, open `http://127.0.0.1:8005/` or `http://127.0.0.1:8005/ui/` in a browser:
 
 - **Tasks**: drag-and-drop or select files to upload (multiple allowed), with an optional `client_id`; see task status, progress, current engine, and elapsed time; cancel or restart tasks. There is no prompt field on the upload form (the SAG desktop never had one either); `prompt` only exists in the task-detail "retry with a new prompt" action and in the `/convert` `task_id` re-run mode.
 - **Task detail**: the engine attempt chain (duration and original error per step), PDF segment progress, rendered Markdown preview with a source view, copy, and download.
@@ -91,7 +93,7 @@ An unsupported format is reported as a per-file error on submit and does not aff
 
 ## API
 
-The base URL is `http://127.0.0.1:3001`. Requests and responses are JSON, except uploads, which use `multipart/form-data`. Every submit endpoint accepts `client_id` both as a form field and as the `X-Client-Id` header; the form field wins, and the value is stored on the task record and in logs.
+The default Docker base URL is `http://127.0.0.1:8005` (the container still listens on port 3001). When running `sag parse-server` directly, the default base URL is `http://127.0.0.1:3001`. Requests and responses are JSON, except uploads, which use `multipart/form-data`. Every submit endpoint accepts `client_id` both as a form field and as the `X-Client-Id` header; the form field wins, and the value is stored on the task record and in logs.
 
 | Method | Path | Description |
 | --- | --- | --- |
@@ -113,8 +115,8 @@ The base URL is `http://127.0.0.1:3001`. Requests and responses are JSON, except
 Example:
 
 ```sh
-curl -F "files=@report.pdf" -F "client_id=my-app" http://127.0.0.1:3001/convert
-curl http://127.0.0.1:3001/tasks/<task_id>/result
+curl -F "files=@report.pdf" -F "client_id=my-app" http://127.0.0.1:8005/convert
+curl http://127.0.0.1:8005/tasks/<task_id>/result
 ```
 
 ## MinerU multi-key setup

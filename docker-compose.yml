@@ -1,15 +1,17 @@
-# SAG-Wiki 文件解析服务器：一键部署
+# SAG-Wiki 文件解析服务器：先构建 Docling 基础镜像，再构建应用镜像
 #
-#   1. cp .env.example .env        # 可选：填 SAG_MINERU_API_KEYS（多个 key 用逗号分隔）
-#   2. docker compose up -d --build
-#   3. 打开 http://<主机>:3001/ui/
+#   1. cp .env.example .env
+#   2. docker compose -f docker-compose.docling-base.yml build
+#   3. docker compose up -d --build
+#   4. 打开 http://<主机>:8005/ui/
 #
 # 说明：
 # - 镜像按宿主机架构自动构建：x86_64（amd64）与 ARM64（树莓派 / Apple Silicon 等）
 #   都支持；多架构发布见 Dockerfile 头部的 buildx 命令。
-# - 镜像自带 Docling 文档与音视频组件（约 6GB，构建期已装好），容器内不再
-#   下载；首次使用时服务把组件从镜像复制进数据卷。MinerU 是云端服务，不在
-#   镜像里。
+# - Docling 文档与音视频组件在单独版本化的基础镜像中（约 6GB）。普通应用更新
+#   只重建 sag 二进制层；首次容器启动先把组件从镜像复制进数据卷，完成后再开 API。
+#   HuggingFace 默认用国内源 https://hf-mirror.net，可由 HF_ENDPOINT 覆盖。
+#   MinerU 是云端服务，不在镜像里。
 # - 不填 key 也能启动：MinerU 未配置时 PDF/图片走本地降级；key 也可在 Web 设置页
 #   里粘贴。环境变量里的 key 只驻留内存，不写入磁盘。
 # - 数据（上传、输出、parse.db、设置）存在具名卷 sag-parse-data 里；换成本地目录
@@ -21,13 +23,20 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      target: app
+      args:
+        SAG_RUNTIME_BASE_IMAGE: "${SAG_RUNTIME_BASE_IMAGE:-sag-parse-server-base:a801f28}"
+        SAG_CARGO_REGISTRY_MIRROR: "${SAG_CARGO_REGISTRY_MIRROR:-sparse+https://rsproxy.cn/index/}"
     image: sag-parse-server:latest
     container_name: sag-parse-server
     restart: unless-stopped
     ports:
-      - "${PORT:-3001}:3001"
+      - "${PORT:-8005}:3001"
     environment:
       SAG_MINERU_API_KEYS: "${SAG_MINERU_API_KEYS:-}"
+      HF_ENDPOINT: "${HF_ENDPOINT:-https://hf-mirror.net}"
+      UV_PYTHON_INSTALL_MIRROR: "${UV_PYTHON_INSTALL_MIRROR:-https://registry.npmmirror.com/-/binary/python-build-standalone}"
+      UV_DEFAULT_INDEX: "${UV_DEFAULT_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}"
       # MinerU 相关域名直连，不走代理（见 parse-server 文档“已知限制”）：
       # 若宿主机设置了 HTTP(S)_PROXY，MinerU 请求被代理时可能超时。
       NO_PROXY: "localhost,127.0.0.1,mineru.net,mineru.oss-cn-shanghai.aliyuncs.com,cdn-mineru.openxlab.org.cn"
@@ -39,7 +48,7 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 10s
+      start_period: 30m
 
 volumes:
   sag-parse-data:
