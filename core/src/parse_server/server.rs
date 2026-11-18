@@ -589,8 +589,7 @@ impl ParseServer {
     }
 
     /// Serve the embedded Web UI. `/` and `/ui[/]` both return the SPA
-    /// shell; assets are addressed by the same relative paths the page
-    /// uses (`./style.css`, `./app.js`).
+    /// shell; assets use absolute `/ui/` paths so all entry URLs work.
     fn handle_ui(path: &str) -> HttpResponse {
         match path {
             "/" | "/ui" | "/ui/" | "/ui/index.html" => {
