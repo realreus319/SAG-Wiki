@@ -17,6 +17,8 @@ Conversion tries the following steps in order and falls back to the next one on 
 
 Long PDFs are split by the upload limit and parsed concurrently, and a failed segment falls back to the local engines; task detail shows "segment N of M" progress. Segmentation is MinerU-first, so choosing anydoc or Docling as the PDF preferred engine skips segmentation and starts the whole file with that engine; choosing MinerU or auto keeps the segmented path.
 
+Segmentation relies on QPDF: the Docker image ships it (`SAG_QPDF=/usr/bin/qpdf`); outside Docker, install QPDF and point `SAG_QPDF` at the executable. Without QPDF conversion still succeeds but falls back to the whole file, so segment concurrency and per-segment fallback stop taking effect.
+
 Tasks are deduplicated by file-content MD5: resubmitting the same file returns the existing task instead of parsing again. You can pass a `client_id` when submitting, so tasks and logs can be attributed to a caller. Uploads are stored on disk under their MD5 with a sharded directory tree; the original file name is kept on the task record and shown in the task list, task detail, and downloads.
 
 ## Docker deployment

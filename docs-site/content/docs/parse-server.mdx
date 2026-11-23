@@ -17,6 +17,8 @@ description: "用 sag parse-server 把文件解析成 Markdown：HTTP API、Web 
 
 长 PDF 会先按上传上限分段并并发解析，失败的分段再降级到本地引擎，任务详情里显示「第 N/M 段」的分段进度。分段路径以 MinerU 为主，因此「PDF 首选引擎」选 anydoc 或 Docling 时会跳过分段，直接整文件用所选引擎开始；选 MinerU 或自动时仍走分段路径。
 
+分段靠 QPDF 拆页：Docker 镜像自带（`SAG_QPDF=/usr/bin/qpdf`），不用 Docker 时需自行安装并设置 `SAG_QPDF` 指向可执行文件。缺少 QPDF 不会导致解析失败，但会退回整文件转换，分段并发和逐段降级都不再生效。
+
 任务按文件内容 MD5 去重：同一文件重复提交直接返回已有任务，不重复解析。提交时可带 `client_id`，用于在任务列表与日志中区分调用方。上传的文件在磁盘上按 MD5 分层存放，原始文件名另存在任务记录里，列表、详情与下载都显示原名。
 
 ## Docker 部署
