@@ -175,10 +175,13 @@ FROM ${SAG_RUNTIME_BASE_IMAGE} AS app
 # 长 PDF 先按上传上限用 QPDF 拆页再并发解析（分段的云端部分失败时只降级
 # 该段）。拆页程序缺失不会让转换失败——预检会退回整文件转换——但分段
 # 并发就失效了，所以应用镜像装上 Debian 自带包并指给 SAG_QPDF。
+# 基础镜像以非 root 的 sag 收尾，装包要临时切回 root。
+USER root
 RUN apt-get update \
     && apt-get install -y --no-install-recommends qpdf \
     && rm -rf /var/lib/apt/lists/*
 ENV SAG_QPDF=/usr/bin/qpdf
+USER sag
 
 COPY --from=builder /out/sag /usr/local/bin/sag
 COPY --chmod=755 scripts/parse-server-entrypoint.sh /usr/local/bin/parse-server-entrypoint
