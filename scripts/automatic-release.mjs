@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
-import {appendFileSync, mkdtempSync, readFileSync, readdirSync, rmSync} from 'node:fs';
+import {appendFileSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join, resolve} from 'node:path';
 import {spawnSync} from 'node:child_process';
@@ -87,6 +87,12 @@ export function releaseNotes(changelog, version) {
   return `## ${section.heading}\n\n${section.body}\n`;
 }
 
+export function releaseBody(version, notes) {
+  assert.ok(stable.test(version) && !version.startsWith('v'), 'Expected stable version');
+  const base = `https://github.com/${repository}/releases/download/v${version}/SAG-Wiki-${version}-`;
+  return `${notes}\n### 下载 / Downloads\n\n| 平台 / Platform | 安装包 / Installer |\n| --- | --- |\n| Windows x64 | [EXE](${base}Windows-x64-setup.exe) |\n| macOS Apple Silicon | [DMG](${base}macOS-arm64.dmg) |\n| macOS Intel | [DMG](${base}macOS-x86_64.dmg) |\n`;
+}
+
 function preparedChangelog(changelog, version, baselineChangelog = '') {
   const reviewed = changelogSection(changelog, version);
   if (reviewed) { releaseNotes(changelog, version); return changelog; }
@@ -166,8 +172,8 @@ export function releaseVersion(manifests, tags, changelog) {
 export function isProductPath(path) {
   return !(/^(?:docs\/|docs-site\/|\.github\/)/.test(path) ||
     /^(?:[^/]+\.md|LICENSE(?:\.[^/]+)?|\.gitignore|\.gitattributes)$/.test(path) ||
-    /^scripts\/(?:automatic-release|documentation-release|release(?:-build-cache|-downloads|-assembly)?|configure-release|migrate-release-environment|rust-dependency-cache|test-profile-ab|parallel-cli)(?:\.node-test)?\.mjs$/.test(path) ||
-    path === 'scripts/rust-dependency-archive.py' || path === 'scripts/fixtures/documentation-history.json');
+    /^scripts\/(?:automatic-release|documentation-release|release(?:-build-cache|-downloads|-assembly|-test-plan)?|configure-release|migrate-release-environment|rust-dependency-cache|test-profile-ab|pr-test-plan|parallel-cli)(?:\.node-test)?\.mjs$/.test(path) ||
+    ['scripts/rust-dependency-archive.py', 'scripts/run-pr-e2e.py', 'tests/local-jev-e2e.py'].includes(path) || path === 'scripts/fixtures/documentation-history.json');
 }
 export const hasProductChanges = paths => paths.some(isProductPath);
 export const changedPaths = (git, base, source) => git.raw('diff', '--name-only', '-z', '--no-renames', base, source, '--').split('\0').filter(Boolean);
@@ -488,9 +494,14 @@ function createDraft() {
   // All platform checks, signed assembly and attestation preceded this command.
   // Recover a partial upload by rebuilding only this exact bot-owned draft.
   if (existing) gh('release', 'delete', tag, '--repo', repository, '--yes');
-  gh('release', 'create', tag, '--repo', repository, '--verify-tag', '--target', commit, '--draft',
-    '--title', `SAG Wiki ${version}`, '--notes-file', join(directory, 'release-notes.md'),
-    ...readdirSync(directory).sort().map(name => join(directory, name)));
+  const temporary = mkdtempSync(join(tmpdir(),'sag-release-body-'));
+  try {
+    const notesFile = join(temporary,'body.md');
+    writeFileSync(notesFile,releaseBody(version,readFileSync(join(directory,'release-notes.md'),'utf8')));
+    gh('release', 'create', tag, '--repo', repository, '--verify-tag', '--target', commit, '--draft',
+      '--title', `SAG Wiki ${version}`, '--notes-file', notesFile,
+      ...readdirSync(directory).sort().map(name => join(directory, name)));
+  } finally { rmSync(temporary,{recursive:true,force:true}); }
   const checksumsDigest = createHash('sha256').update(readFileSync(join(directory, checksumName))).digest('hex');
   if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `checksums=${checksumsDigest}\n`);
   summary(`Verified draft ready for automatic publication: https://github.com/${repository}/releases/tag/${tag}`);
@@ -506,7 +517,8 @@ export function validatePublicationAssets(release, checksums, expectedDigest, ve
   });
   entries.push({name: `v${version}-SHA256SUMS.txt`, digest: `sha256:${expectedDigest}`});
   const expectedNames = [`SAG-Wiki-${version}-macOS-arm64.dmg`, `SAG-Wiki-${version}-macOS-arm64.app.tar.gz`,
-    `SAG-Wiki-${version}-macOS-arm64.app.tar.gz.sig`, `SAG-Wiki-${version}-Windows-x64-setup.exe`,
+    `SAG-Wiki-${version}-macOS-arm64.app.tar.gz.sig`,
+    `SAG-Wiki-${version}-macOS-x86_64.dmg`, `SAG-Wiki-${version}-macOS-x86_64.app.tar.gz`, `SAG-Wiki-${version}-macOS-x86_64.app.tar.gz.sig`, `SAG-Wiki-${version}-Windows-x64-setup.exe`,
     `SAG-Wiki-${version}-Windows-x64-setup.exe.sig`, 'latest-v2.json', 'latest.json', 'build-metadata.json',
     'release-notes.md', `v${version}-SHA256SUMS.txt`].sort();
   assert.deepEqual(entries.map(entry => entry.name).sort(), expectedNames, 'Unexpected assembled asset manifest');
@@ -528,7 +540,47 @@ export function releaseForTag(tag, list = pages, read = api) {
   return read(`releases/${release.id}`);
 }
 
-function publish() {
+const transientReleaseError = error => /HTTP (?:404|408|429|5\d\d)\b|Release v\d+\.\d+\.\d+ not found|connection reset|connection refused|timed? out|timeout|unexpected EOF|ETIMEDOUT|ECONNRESET|EAI_AGAIN|TLS handshake/i.test(String(error));
+const releaseRetryPause = milliseconds => new Promise(resolve => setTimeout(resolve,milliseconds));
+
+async function retryReleaseRequest(request, pause) {
+  for (let attempt=0; ; attempt++) {
+    try { return await request(); }
+    catch (error) {
+      if (attempt === 2 || !transientReleaseError(error)) throw error;
+      await pause(1000 * (2 ** attempt));
+    }
+  }
+}
+
+export async function publishDraftById(release, tag, validate, listReleases, {
+  download, read, update, pause=releaseRetryPause,
+}) {
+  assert.ok(Number.isSafeInteger(release.id) && release.id > 0, 'Invalid release ID');
+  const assets = release.assets?.filter(asset => asset.name === `${tag}-SHA256SUMS.txt`) ?? [];
+  assert.ok(assets.length === 1 && Number.isSafeInteger(assets[0].id) && assets[0].id > 0,
+    'Expected a unique checksum asset ID');
+  const checksums = await retryReleaseRequest(() => download(assets[0].id), pause);
+  validate(checksums);
+  for (let attempt=0; ; attempt++) {
+    const releases = await retryReleaseRequest(listReleases, pause);
+    if (releases.some(current => current.id === release.id && current.draft === false)) return;
+    const latest = latestPublished(releases);
+    const makeLatest = !latest || compareVersions(tag, latest.tag_name) > 0;
+    try { return await update(release.id, makeLatest); }
+    catch (error) {
+      if (!transientReleaseError(error)) throw error;
+      const current = await retryReleaseRequest(() => read(release.id), pause);
+      assert.equal(current.id, release.id, 'Unexpected release during retry');
+      if (current.draft === false) return;
+      assert.equal(current.draft, true, 'Unknown release state');
+      if (attempt === 2) throw error;
+      await pause(1000 * (2 ** attempt));
+    }
+  }
+}
+
+async function publish() {
   assert.equal(process.env.GITHUB_REPOSITORY, repository);
   const tag = process.env.RELEASE_TAG;
   const version = process.env.RELEASE_VERSION;
@@ -536,7 +588,7 @@ function publish() {
   assert.equal(tag, `v${version}`);
   assert.equal(git('rev-parse', 'HEAD'), commit);
   validateReleaseSource(git, commit, tag);
-  const release = releaseForTag(tag);
+  const release = await retryReleaseRequest(() => releaseForTag(tag), releaseRetryPause);
   assert.equal(release.prerelease, false);
   assert.equal(release.tag_name, tag);
   // The preceding assembly job owns the draft and its immutable assets. A rerun
@@ -544,12 +596,20 @@ function publish() {
   if (!release.draft) { summary(`${tag} is already published.`); return; }
   validateReleaseDocumentation(git, commit, version);
   validateReplaceableDraft(release, {tag, commit});
-  const checksums = execute('gh', ['release', 'download', tag, '--repo', repository, '--pattern', `${tag}-SHA256SUMS.txt`, '--output', '-'], {trim: false});
-  validatePublicationAssets(release, checksums, process.env.RELEASE_CHECKSUMS, version);
-  const latest = latestPublished(pages('releases'));
-  const makeLatest = !latest || compareVersions(version, latest.tag_name) > 0;
-  gh('release', 'edit', tag, '--repo', repository, '--draft=false', `--latest=${makeLatest}`);
-  summary(`Published ${tag}; latest=${makeLatest}. All platform, documentation, signature and provenance checks passed.`);
+  const startedAt = Date.now();
+  await publishDraftById(release, tag,
+    checksums => validatePublicationAssets(release, checksums, process.env.RELEASE_CHECKSUMS, version),
+    () => pages('releases'), {
+      download: id => execute('gh', ['api', '-H', 'Accept: application/octet-stream', `repos/${repository}/releases/assets/${id}`], {trim:false,timeout:20000}),
+      read: id => JSON.parse(execute('gh', ['api', `repos/${repository}/releases/${id}`], {timeout:20000})),
+      update: (id, makeLatest) => {
+        const updated = JSON.parse(execute('gh', ['api','--method','PATCH',`repos/${repository}/releases/${id}`,'--input','-'],
+          {input:JSON.stringify({draft:false,make_latest:String(makeLatest)}),timeout:20000}));
+        assert.equal(updated.id,id);
+        assert.equal(updated.draft,false);
+      },
+    });
+  summary(`Published ${tag} by Release ID ${release.id} in ${((Date.now()-startedAt)/1000).toFixed(1)}s after draft validation. All platform, documentation, signature and provenance checks passed.`);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
@@ -562,5 +622,5 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   else if (process.argv[2] === 'prepare') prepare();
   else if (process.argv[2] === 'request') request();
   else if (process.argv[2] === 'check-draft') checkDraft();
-  else if (process.argv[2] === 'create-draft') createDraft(); else publish();
+  else if (process.argv[2] === 'create-draft') createDraft(); else await publish();
 }

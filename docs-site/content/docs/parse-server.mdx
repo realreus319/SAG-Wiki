@@ -15,6 +15,8 @@ description: "用 sag parse-server 把文件解析成 Markdown：HTTP API、Web 
 4. 纯文本（txt、md、markdown、rst、json、xml）不走转换链，直接读入原文（桌面端也是直接读文本，不经过转换引擎），不依赖任何组件。
 5. 音视频：先走 Docling media，失败再用 ffmpeg 抽音 + ASR；视频还需要配置视觉模型才能生成时间线总结，否则任务失败并在错误中说明原因。
 
+长 PDF 会先按上传上限分段并并发解析，失败的分段再降级到本地引擎，任务详情里显示「第 N/M 段」的分段进度。分段路径以 MinerU 为主，因此「PDF 首选引擎」选 anydoc 或 Docling 时会跳过分段，直接整文件用所选引擎开始；选 MinerU 或自动时仍走分段路径。
+
 任务按文件内容 MD5 去重：同一文件重复提交直接返回已有任务，不重复解析。提交时可带 `client_id`，用于在任务列表与日志中区分调用方。上传的文件在磁盘上按 MD5 分层存放，原始文件名另存在任务记录里，列表、详情与下载都显示原名。
 
 ## Docker 部署
@@ -70,6 +72,8 @@ sag docling install --data-dir /path/to/data  # 指定数据目录，默认 SAG 
 - **音视频组件**：openai-whisper + whisper-tiny 模型 + 内置 ffmpeg；音视频走 Docling media 时用它。
 
 组件装在数据目录下（`docling/` 与 `docling/media/`），一次安装后一直可用。基础镜像里预装的组件在 `/opt/sag/docling-documents` 与 `/opt/sag/docling-media`；Docker 入口脚本在 API 启动前调用 `sag docling install`，将组件复制进数据目录。已有组件时不会重复复制。自己预构建组件目录也可以用 `SAG_DOCLING_COMPONENT_DIR` / `SAG_DOCLING_MEDIA_COMPONENT_DIR` 指向（目录里须有 `manifest.json`、Python、site-packages 与模型）。
+
+组件安装与启动遵循同一数据目录里的「网络代理」设置（桌面端或 CLI 配置，解析服务的 Web UI 不单独配置）：`sag docling install` 与解析服务自动拉起组件时都使用这份代理，未配置时直连。
 
 ## Web UI
 
@@ -133,7 +137,7 @@ curl http://127.0.0.1:8005/tasks/<task_id>/result
 
 ## 设置说明
 
-- **每种类型选首选引擎**：PDF、Office 文档、图片各选一个首选引擎（自动 / MinerU / anydoc / Docling，图片没有 anydoc）；选中的引擎先试，失败后其余引擎仍按默认顺序降级。音频可选 Docling media 或 ASR 直转，视频可选 Docling media 或时间线总结（ASR + 视觉模型）。
+- **每种类型选首选引擎**：PDF、Office 文档、图片各选一个首选引擎（自动 / MinerU / anydoc / Docling，图片没有 anydoc）；选中的引擎先试，失败后其余引擎仍按默认顺序降级。PDF 选 anydoc 或 Docling 这类本地引擎时会跳过 MinerU 分段路径，保证首选引擎先跑；选 MinerU 或自动仍按分段路径并发解析。音频可选 Docling media 或 ASR 直转，视频可选 Docling media 或时间线总结（ASR + 视觉模型）。
 - **每个引擎单独配置**：点「配置」打开该引擎的设置表——MinerU（开关、模型、解析方式、OCR/表格/公式、超时与并发）、anydoc（Office 仅提取文字、大小上限）、Docling（超时、线程、OCR/表格）、ASR（引擎、服务地址、模型、超时与切片）、视觉模型（服务地址、模型、Key、系统提示词）。
 - **队列并发**：默认 4，可在 1–16 之间调整，改动对新启动的任务即时生效。
 - **MinerU 并发**：云端并发默认 2，可在 1–16 之间调整。

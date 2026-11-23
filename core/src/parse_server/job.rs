@@ -212,13 +212,21 @@ impl JobRunner {
             &settings,
             || cancel.load(Ordering::Relaxed),
             |attempt| {
-                let (seg_current, seg_total) = match attempt.segment {
-                    Some(segment) => (
-                        Some(u32::try_from(segment.current).unwrap_or(u32::MAX)),
-                        Some(u32::try_from(segment.total).unwrap_or(u32::MAX)),
-                    ),
-                    None => (None, None),
-                };
+                // Segmented PDFs report the overall snapshot in
+                // `segment_status` (with the representative unfinished
+                // segment); a single part also sets `segment` directly.
+                let segment = attempt.segment.clone().or_else(|| {
+                    attempt
+                        .segment_status
+                        .as_ref()
+                        .and_then(|(_, segment)| segment.clone())
+                });
+                let seg_current = segment
+                    .as_ref()
+                    .map(|segment| u32::try_from(segment.current).unwrap_or(u32::MAX));
+                let seg_total = segment
+                    .as_ref()
+                    .map(|segment| u32::try_from(segment.total).unwrap_or(u32::MAX));
                 if let Some(total) = seg_total {
                     if total > 0 {
                         let mut state = outcome_state.borrow_mut();

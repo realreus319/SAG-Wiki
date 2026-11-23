@@ -156,6 +156,13 @@ impl ParseServer {
     fn maybe_stage_prebuilt_docling(self: &Arc<Self>) {
         use sag_protocol::DoclingProfile;
         let docling = std::sync::Arc::new(crate::docling::Docling::new(&self.data_dir));
+        // Staging only copies from a local image directory, but the same
+        // proxy setting drives any component work that follows, so pass the
+        // configured proxy through instead of silently bypassing it.
+        let proxy = self
+            .settings()
+            .map(|settings| settings.model_proxy)
+            .unwrap_or_default();
         let mut wanted: Vec<DoclingProfile> = Vec::new();
         for (profile, var) in [
             (DoclingProfile::Documents, "SAG_DOCLING_COMPONENT_DIR"),
@@ -196,7 +203,7 @@ impl ParseServer {
                 Some("docling"),
                 None,
             );
-            if let Err(error) = docling.start_profiles(wanted) {
+            if let Err(error) = docling.start_profiles(wanted, proxy) {
                 let _ = server.log(
                     "error",
                     None,

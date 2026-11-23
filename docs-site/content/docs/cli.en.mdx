@@ -7,7 +7,7 @@ description: "Commands, output formats and index management."
 
 sag runs independently, without installing or starting SAG Wiki desktop. Retrieval commands automatically start or reuse the local service.
 
-With Node.js 18 or later installed, run on macOS Apple Silicon, Windows x64 or Linux ARM64/x86_64:
+With Node.js 18 or later installed, run on an Apple Silicon Mac, Intel Mac (starting with `0.3.11`), Windows x64 or Linux ARM64/x86_64:
 
 ```sh
 npm install -g @zleap-ai/sag
@@ -38,6 +38,8 @@ Give your agent the [SAG Skill GitHub link](https://github.com/Zleap-AI/SAG-Wiki
 ## Sharing with desktop
 
 CLI and the optional SAG Wiki desktop use the same indexing, retrieval and configuration implementation in `core/`, along with the same user data directory, `sag.sqlite`, keys and ignore rules.
+
+Use an updated CLI to save model settings when the desktop app uses an interface language introduced in 0.3.13. A standalone 0.3.12 CLI can connect to a running 0.3.13 service. If it starts its own older service, saving settings can fail because that service does not support the saved language. Launch the updated desktop app to update its managed CLI. Update an npm-managed CLI separately.
 
 - Desktop and CLI share a standalone background service, configuration and knowledge base. Directory changes appear in both.
 - On macOS, the service keeps running after the desktop client exits, so CLI and MCP remain available. On Windows, quitting from the tray or app menu also stops the service. Reopening the desktop or running a CLI command that needs the service starts it on demand. `sag add` returns after indexing finishes; the running service watches file and ignore-rule changes.
@@ -85,7 +87,7 @@ sag uninstall cli
 
 Search requires no `search` subcommand: run `sag "search query"` directly. `add`, `remove`, `list`, `check`, `status`, `config`, `service`, `install` and `uninstall` are reserved management commands. Use `--` when searching those literal words or queries beginning with `-`, for example `sag -c -- "status"`.
 
-Search defaults to the current working directory. A positional path and `--path` cannot be combined. The default result limit is 10 chunks, with 1–100 allowed. `-c` changes output only, without changing recall or ranking. Paths resolve relative to the command's working directory. JSON includes absolute paths, line numbers, actual ranges and truncation flags. Only `-c` returns `content`. Separate source ranges are output separately, so discontinuous chunks are not represented as continuous lines.
+Search defaults to the current working directory. A positional path and `--path` cannot be combined. Semantic search uses up to 10 retrieved candidates to assemble the output by default. Set `-m` to a value from 1 to 100. The per-round candidate setting can lower the number used. `-c` changes output only, without changing recall or ranking. Paths resolve relative to the command's working directory. JSON includes absolute paths, line numbers, actual ranges and truncation flags. Only `-c` returns `content`. Output is grouped by file path and heading. Overlapping or adjacent source ranges are merged, and disjoint ranges are returned separately.
 
 ### Regular-expression and fixed-string matching
 
@@ -162,9 +164,14 @@ sag share ./notes
 sag share ./notes/example.md
 sag download ABCDEFGH
 sag download SAG-ABCDEFGH --output ./received
+sag share-history
+sag share-history --json
+sag cancel-share SAG-ABCDEFGH
 ```
 
 `share` uploads Markdown and referenced images and returns a code valid for one hour. `download` verifies and extracts the files to `sag-wiki/share/share-name/` inside your system Documents folder. It uses the default download folder configured in the desktop app; `--output` overrides it for one download. Duplicate folder names receive a numbered suffix without overwriting existing files. The CLI prints the saved path; run `sag add saved-path` to add it to your knowledge base.
+
+`share-history` lists unexpired shares recorded on this device. `--json` returns names, codes, sharing and expiration times without management credentials; expired records are deleted locally. `cancel-share` uses the stored management credentials and accepts a code with or without `SAG-`. On success, the code is invalid and the server file and local share record have been deleted. Failed cancellations retain the local record for retry; previously downloaded copies are unaffected. Shares without a local record cannot be cancelled.
 
 See [file sharing](/en/docs/file-sharing) for supported content and limits.
 
@@ -205,7 +212,7 @@ Windows uses a separate console `sag.exe`, bundled with the application installe
 - File changed: wait for the watcher to update, then query again.
 - Installation conflict: retain existing files and establish their origin before resolving it manually.
 
-For development and testing, `SAG_DATA_DIR` selects an isolated data directory. CLI and desktop must use the same value to share it.
+After migrating data in the desktop app under [Settings → Data and privacy → Application data location](/en/docs/privacy), CLI versions that support this feature automatically use the same directory. For development and testing, `SAG_DATA_DIR` selects an isolated data directory. CLI and desktop must use the same value to share it; the environment variable takes precedence over the saved location.
 
 ## Automatic terminal configuration
 
@@ -226,3 +233,9 @@ For development, builds and code checks, see the [development guide](/en/docs/de
 Search defaults to the current working directory; `--path` overrides it. Semantic search and `-E` / `-F` accept repeated `--exclude` patterns relative to the search root, e.g. `sag "aberration" --path "F:/docs" --exclude "archive/**" --exclude "backup/"`. Exclusions apply before candidate retrieval and JEV scoring, without deleting files or indexes. Excluding everything returns no results. Patterns without slashes also match file names. Converted documents in semantic search are matched by their original relative paths and extensions.
 
 For semantic searches with exclusions, each search uses the files allowed when filtering runs; newly added files are included on the next search.
+
+### API key folder scopes
+
+Repeat `--path` to select imported absolute directories, for example `sag api key create --name "Project A" --path "/data/project-a" --path "/data/shared"`. Omitting paths or explicitly choosing `--all` preserves full-library access. Existing keys and MCP configurations remain compatible after upgrading.
+
+Use `sag api key set-scope KEY_ID --path "/data/project-a"` to change a scope or `sag api key set-scope KEY_ID --all` to restore full-library access; one choice is required. Creation, scope changes and listing accept `--json`; listing shows scopes without full secrets. Scope changes apply immediately and cancel that key’s running and queued requests. Export project configurations with `sag api mcp config --key-id KEY_ID`. See [Limit folders by project](/en/docs/api-guide#limit-folders-by-project).

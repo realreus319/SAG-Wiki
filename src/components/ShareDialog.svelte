@@ -5,6 +5,8 @@
  import Modal from './ui/Modal.svelte';
  import Input from './ui/Input.svelte';
  import ShareHelp from './ShareHelp.svelte';
+ import ShareHistory from './ShareHistory.svelte';
+ let historyOpen=false;
  import {api} from '../lib/api';
  import {t} from '../lib/i18n';
  import {icon} from '../lib/icons';
@@ -19,6 +21,7 @@
  let codeInput:HTMLInputElement|null=null;
  type Preview={id:string;name:string;markdown_count:number;image_count:number;size:number};
  let preview:Preview|null=null,error='',code=initialCode,shared='',expires='',directory='',received='',copied=false,preparing=true;
+ $: {const match=code.trim().match(/^(?:(?:分享码[：:]|share code:)\s*)?(?:SAG-)?([A-HJ-NP-Z2-9]{8})(?![A-Z0-9])/i);if(match)code='SAG-'+match[1].toUpperCase();}
  $: displaySize=preview ? (preview.size<1024 ? `${preview.size} B` : preview.size<1048576 ? `${(preview.size/1024).toFixed(1)} KB` : `${(preview.size/1048576).toFixed(2)} MB`) : '';
  const close=()=>{if(!busy)onClose()};
  onMount(async()=>{
@@ -40,7 +43,7 @@
  {#if !embedded}<div class="dialog-head"><h2>{$t(path?'分享':'接收分享')}</h2><Button.Root class="icon-button" aria-label={$t('关闭')} disabled={busy} onclick={close}>{@html icon('close')}</Button.Root></div>{/if}
  <div class="share-body">
   {#if received}<p class="share-complete">{$t('下载完成')}</p><p class="share-path">{received}</p>
-  {:else if shared}<div class="share-result"><div class="share-code-row"><p class="share-code">{shared}</p><ShareHelp onError={message=>error=message}/></div><p class="share-instructions">{$t('将分享码发给对方。对方复制后打开 SAG 即可接收，也可在“设置 → 数据导入”中输入分享码。')}</p><Button.Root class="outline" onclick={async()=>{try{await copyText($t('分享码：{value0}\n复制此分享码，打开SAG-Wiki即可下载对应文件内容',{value0:shared}));copied=true;error=''}catch(e){error=String(e)}}}>{@html icon('copy')}{$t(copied?'已复制':'复制分享码')}</Button.Root><p class="share-hint share-expiry"><span aria-hidden="true">{@html icon('clock')}</span>{$t('有效期至 {value0}',{value0:new Date(expires).toLocaleString()})}</p></div>
+  {:else if shared}<div class="share-result"><div class="share-code-row"><p class="share-code">{shared}</p><ShareHelp onError={message=>error=message}/></div><p class="share-instructions">{$t('将分享码发给对方。对方复制后打开 SAG 即可接收，也可在“设置 → 数据源”中输入分享码。')}</p><Button.Root class="outline" onclick={async()=>{try{await copyText($t('分享码：{value0}\n复制此分享码，打开SAG-Wiki即可下载对应文件内容',{value0:shared}));copied=true;error=''}catch(e){error=String(e)}}}>{@html icon('copy')}{$t(copied?'已复制':'复制分享码')}</Button.Root><p class="share-hint share-expiry"><span aria-hidden="true">{@html icon('clock')}</span>{$t('有效期至 {value0}',{value0:new Date(expires).toLocaleString()})}</p></div>
   {:else if path}
    {#if preview}
     <div class="share-package">
@@ -58,10 +61,12 @@
   {/if}
   {#if error}<p class="share-error" role="alert">{$t(error)}</p>{/if}
  </div>
- <div class="dialog-footer"><Button.Root class="outline" disabled={busy} onclick={close}>{$t(shared||received?'关闭':'取消')}</Button.Root>{#if !shared&&!received}<Button.Root class="primary" disabled={busy||(path?!preview:!code.trim()||!directory)} onclick={submit}><span aria-hidden="true">{@html icon(path?'share':'download')}</span>{$t(preparing?'正在准备…':busy?(path?'正在上传…':'正在下载…'):(path?'分享':'下载'))}</Button.Root>{/if}</div>
+ <div class="dialog-footer">{#if path}<Button.Root type="button" class="share-history-button" disabled={busy} onclick={()=>historyOpen=true}>{$t('分享记录')}</Button.Root>{/if}<Button.Root class="outline" disabled={busy} onclick={close}>{$t(shared||received?'关闭':'取消')}</Button.Root>{#if !shared&&!received}<Button.Root class="primary" disabled={busy||(path?!preview:!code.trim()||!directory)} onclick={submit}><span aria-hidden="true">{@html icon(path?'share':'download')}</span>{$t(preparing?'正在准备…':busy?(path?'正在上传…':'正在下载…'):(path?'分享':'下载'))}</Button.Root>{/if}</div>
 {/snippet}
 {#if embedded}<div class="share-embedded">{@render content()}</div>{:else}<Modal label={$t(path?'分享':'接收分享')} class="share-dialog" onClose={close}>{@render content()}</Modal>{/if}
+{#if historyOpen}<ShareHistory onClose={()=>historyOpen=false}/>{/if}
 <style>
+ .dialog-footer :global(.share-history-button){margin-right:auto;color:var(--color-secondary)}
  .share-label-heading,.share-code-row{display:flex;align-items:center;gap:4px}
  .share-code-row{justify-content:center;position:relative}
  .share-code-row :global(.share-help){position:absolute;left:calc(100% + 4px)}

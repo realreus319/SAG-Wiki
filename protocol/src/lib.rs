@@ -1,8 +1,11 @@
 pub mod about_links;
+pub mod agent_artifacts;
 pub mod chat_import;
+pub mod online_import;
 pub use chat_import::*;
 pub mod parse_settings;
 pub mod runtime;
+pub mod locales;
 pub mod mineru;
 mod build;
 mod cli;
@@ -10,7 +13,7 @@ pub mod explore;
 mod retrieval;
 pub mod types;
 mod api;
-pub use api::ApiAction;
+pub use api::{ApiAction, ApiScope};
 pub use build::*;
 pub use cli::*;
 use explore::*;
@@ -163,11 +166,30 @@ pub struct ConversionSegment {
     pub end_page: u32,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ActiveSegment {
+    pub segment_id: usize,
+    pub start_page: u32,
+    pub end_page: u32,
+    pub engine: String,
+    pub phase: String,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SegmentProgress {
+    pub total: usize,
+    pub completed: usize,
+    pub active: Vec<ActiveSegment>,
+    pub waiting_local: usize,
+    pub failed: usize,
+    pub cancelled: usize,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IndexConversion {
     pub path: String,
     pub engine: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub segment: Option<ConversionSegment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segment_progress: Option<SegmentProgress>,
 }
 /// Unique indexed targets checked in a task, independent of phase traversal totals.
 /// An update followed by a failure counts in both fields: actual writes are retained.
@@ -215,6 +237,8 @@ pub struct IndexHistory {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IndexFileLog {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segment: Option<ConversionSegment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<String>,
@@ -260,6 +284,8 @@ pub struct EventEnvelope {
 #[serde(tag = "operation", content = "args", rename_all = "snake_case")]
 pub enum Operation {
     Api { action: ApiAction },
+    OnlineImport { action: online_import::Action },
+    AgentArtifacts { action: agent_artifacts::Action },
     DoclingStatus,
     InstallDocling,
     ImportDoclingComponent {
@@ -291,6 +317,9 @@ pub enum Operation {
     ReadDocument {
         path: String,
     },
+    ReadHelpDocument {
+        path: String,
+    },
     SaveDocument {
         path: String,
         body: String,
@@ -298,6 +327,8 @@ pub enum Operation {
     },
     GetChatImportFolder,
     SetChatImportFolder { path: String },
+    GetChatImportSchedule { source: ChatSource },
+    SaveChatImportSchedule { source: ChatSource, schedule: ChatImportSchedule },
     ListChatSessions { source: ChatSource, source_root: Option<String>, #[serde(default)] query: ChatListQuery },
     PreviewChatImport { source: ChatSource, source_root: String, paths: Vec<String>, include_tools: bool },
     ImportChatSessions { source: ChatSource, source_root: String, sessions: Vec<ChatSession>, include_tools: bool },
@@ -351,8 +382,15 @@ pub enum Operation {
     },
     GetSettings,
     RuntimeSchema,
+    /// Probe the saved answer model address through draft proxy settings.
+    TestProxyConnection { proxy: types::ModelProxy },
     MineruSchema,
-    TestMineru { config: crate::mineru::MineruConfig, key: String },
+    TestMineru {
+        config: crate::mineru::MineruConfig,
+        key: String,
+        #[serde(default)]
+        model_proxy: Option<types::ModelProxy>,
+    },
     ClearMineruKey { config: crate::mineru::MineruConfig },
     RegisterDoclingComponent {
         path: String,
@@ -372,10 +410,14 @@ pub enum Operation {
         kind: String,
         config: ModelConfig,
         key: String,
+        #[serde(default)]
+        model_proxy: Option<types::ModelProxy>,
     },
     ListAnswerModels {
         config: ModelConfig,
         key: String,
+        #[serde(default)]
+        model_proxy: Option<types::ModelProxy>,
     },
     TestMcp {
         server: McpServer,
@@ -466,6 +508,7 @@ pub enum Operation {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum Output {
     ChatCatalog(ChatCatalog),
+    ChatImportSchedule(ChatImportScheduleStatus),
     ChatPreview(ChatPreview),
     ChatImports(Vec<ChatImportItem>),
     Api(serde_json::Value),

@@ -5,6 +5,8 @@ description: "Send and receive Markdown documents and images using share codes."
 
 File sharing lets you send Markdown documents, folders, and referenced images to others. Recipients can download the content using a share code and add it to their own knowledge base without creating an account.
 
+Files are encrypted before upload and stored temporarily in encrypted form. Recipients can download and view them using the share code, which expires after one hour.
+
 ## Share files
 
 In the desktop app, right-click a Markdown file or folder and choose **Share**. SAG packages Markdown documents and the local images they reference. Folder shares preserve their structure and skip other files and unreferenced images. Sizes are shown in B, KB or MB. Review the document count, image count and size, then choose **Share** and send the `SAG-XXXXXXXX` code.
@@ -20,21 +22,31 @@ Copy this share code and open SAG-Wiki to download the shared files.
 
 ## Receive a share
 
-Copy the share code you received, then open or switch back to SAG Wiki. It automatically detects the clipboard content and opens the receive dialog. You can copy `SAG-XXXXXXXX` alone or the full Chinese or English share message, including its download instructions. Review the save location and choose **Download** to start downloading. Clipboard detection is enabled by default.
+Copy the share code you received, then open or switch back to SAG Wiki. It automatically detects the clipboard content and opens the receive dialog. You can copy `SAG-XXXXXXXX` alone or the full Chinese or English share message, including its download instructions. Pasting the full message into the code field automatically keeps only the share code, whether the instructions are on the same line or a separate line. Review the save location and choose **Download** to start downloading. Clipboard detection is enabled by default.
 
 Codes contain eight letters and digits. The `SAG-` prefix is optional when entering a code.
 
-Open the **Receive share** tab in the Add folder window, or right-click an empty area of the file list and choose **Receive share**. The right-click action opens a standalone receive dialog without tabs. Enter the code and download. You can also use **Settings → Data import → Share → Enter share code**. Opening from an empty area inside a folder uses that folder as the save location. The overview and other entry points use your configured default (`sag-wiki/share/share-name/` inside Documents). You can change it for this download without changing the saved default. Existing folders are preserved and duplicate names receive a numbered suffix. Completed downloads are added to your knowledge base.
+Open the **Receive share** tab in the Add folder window, or right-click an empty area of the file list and choose **Receive share**. The right-click action opens a standalone receive dialog without tabs. Enter the code and download. You can also use **Settings → Data sources → Share → Enter share code**. Opening from an empty area inside a folder uses that folder as the save location. The overview and other entry points use your configured default (`sag-wiki/share/share-name/` inside Documents). You can change it for this download without changing the saved default. Existing folders are preserved and duplicate names receive a numbered suffix. Completed downloads are added to your knowledge base.
 
 ![Receive a share and choose a save location](/images/product-receive-en.png)
 
 ## Default folder and clipboard
 
-Use **Settings → Data import → Share** to change the default download folder or turn **Detect share codes in clipboard** off or back on. Changes are saved immediately.
+Use **Settings → Data sources → Share** to change the default download folder or turn **Detect share codes in clipboard** off or back on. Changes are saved immediately.
+
+## Share history and cancellation
+
+Select **Share history** at the bottom left of the sharing dialog, or open **Settings → Data sources → Share → Share history → View**, to see names, codes, sharing times and expiration times for shares created on this device. Records are stored locally and deleted automatically after expiration, including cleanup on the next app start. Only shares created after this feature is enabled can be recorded.
+
+Choose **Cancel share** for an active share and confirm. The code stops working immediately; cancellation reports success after the server deletes the corresponding OSS file. Deletion failures are shown and can be retried. Previously downloaded copies are unaffected. After successful cancellation, the local record is deleted and removed from the list immediately. Failed cancellations retain the record for retry.
 
 ## Expiration
 
 Shares are available for one hour with repeat downloads. Downloads stop at expiry and the server subsequently removes the files. No account is required. Anyone with the code can download, so send it only to intended recipients.
+
+## Encryption
+
+The desktop app and CLI automatically encrypt uploads and decrypt downloads. No password is required, and share codes remain eight characters long. The server temporarily decrypts packages for validation, then stores only the encrypted package. Decryption keys are stored encrypted and removed when the share expires. A storage download URL alone cannot decrypt a package; anyone with the share code can download and open it. Use a client version that supports encrypted sharing.
 
 ## Supported content
 

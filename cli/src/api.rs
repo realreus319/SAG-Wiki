@@ -1,6 +1,6 @@
 use anyhow::{bail, Result};
 use clap::Subcommand;
-use sag_protocol::{ApiAction, Operation, Output};
+use sag_protocol::{ApiAction, ApiScope, Operation, Output};
 use serde_json::{json, Value};
 use std::time::Duration;
 
@@ -46,6 +46,22 @@ pub enum KeyCommand {
     Create {
         #[arg(long)]
         name: String,
+        /// 允许访问的完整目录路径，可重复传入；省略时保持全库权限。
+        #[arg(long = "path", conflicts_with = "all")]
+        paths: Vec<String>,
+        /// 显式允许访问全部知识库，包括以后新增的目录。
+        #[arg(long, conflicts_with = "paths")]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 修改指定 Key 的目录范围，并取消该 Key 的在途请求。
+    SetScope {
+        id: String,
+        #[arg(long = "path", required_unless_present = "all", conflicts_with = "all")]
+        paths: Vec<String>,
+        #[arg(long, conflicts_with = "paths")]
+        all: bool,
         #[arg(long)]
         json: bool,
     },
@@ -85,6 +101,24 @@ pub enum WebCommand {
     },
     Stop,
     Code,
+    /// 设置网页访问码：off 允许能连接网页地址的任何人直接进入。
+    AccessCode {
+        #[arg(value_enum)]
+        mode: WebAccessCode,
+    },
+    /// 保存网页外部访问地址；使用 --clear 清除。
+    ExternalUrl {
+        #[arg(required_unless_present = "clear", conflicts_with = "clear")]
+        url: Option<String>,
+        #[arg(long)]
+        clear: bool,
+    },
+}
+
+#[derive(Clone, clap::ValueEnum)]
+pub enum WebAccessCode {
+    On,
+    Off,
 }
 
 async fn call(client: &sag_client::Client, action: ApiAction) -> Result<Value> {
@@ -95,6 +129,10 @@ async fn call(client: &sag_client::Client, action: ApiAction) -> Result<Value> {
         Output::Api(value) => Ok(value),
         _ => bail!("API 管理返回了无效响应"),
     }
+}
+
+fn key_scope(paths: &[String]) -> ApiScope {
+    if paths.is_empty() { ApiScope::All } else { ApiScope::Folders { paths: paths.to_vec() } }
 }
 
 fn mcp_addresses(status: &Value) -> (String, Vec<String>) {
@@ -133,10 +171,19 @@ pub fn run(command: &ApiCommand) -> Result<()> {
         ApiCommand::Web { action: WebCommand::Start { host, port } } => ApiAction::WebStart { host: host.clone(), port: *port },
         ApiCommand::Web { action: WebCommand::Stop } => ApiAction::WebStop,
         ApiCommand::Web { action: WebCommand::Code } => ApiAction::WebCode,
+        ApiCommand::Web { action: WebCommand::AccessCode { mode } } => ApiAction::WebSetAccessCode { required: matches!(mode, WebAccessCode::On) },
+        ApiCommand::Web { action: WebCommand::ExternalUrl { url, .. } } => ApiAction::WebSetExternalUrl { url: url.clone() },
         ApiCommand::Status { .. } => ApiAction::Status,
         ApiCommand::Key {
-            action: KeyCommand::Create { name, .. },
-        } => ApiAction::CreateKey { name: name.clone() },
+            action: KeyCommand::Create { name, paths, .. },
+        } => if paths.is_empty() {
+            ApiAction::CreateKey { name: name.clone() }
+        } else {
+            ApiAction::CreateScopedKey { name: name.clone(), paths: paths.clone() }
+        },
+        ApiCommand::Key {
+            action: KeyCommand::SetScope { id, paths, .. },
+        } => ApiAction::UpdateKeyScope { id: id.clone(), scope: key_scope(paths) },
         ApiCommand::Key {
             action: KeyCommand::List { .. },
         } => ApiAction::ListKeys,
@@ -194,7 +241,7 @@ pub fn run(command: &ApiCommand) -> Result<()> {
         ApiCommand::Status { json: true }
             | ApiCommand::Mcp { .. }
             | ApiCommand::Key {
-                action: KeyCommand::Create { json: true, .. } | KeyCommand::List { json: true }
+                action: KeyCommand::Create { json: true, .. } | KeyCommand::SetScope { json: true, .. } | KeyCommand::List { json: true }
             }
     );
     if json {
@@ -215,16 +262,20 @@ pub fn run(command: &ApiCommand) -> Result<()> {
         } => {
             for key in value.as_array().unwrap() {
                 println!(
-                    "{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}",
                     key["id"].as_str().unwrap(),
                     key["name"].as_str().unwrap(),
-                    key["prefix"].as_str().unwrap()
+                    key["prefix"].as_str().unwrap(),
+                    if key["scope"]["type"] == "folders" { key["scope"]["paths"].as_array().unwrap().iter().map(|path| path.as_str().unwrap()).collect::<Vec<_>>().join("; ") } else { "全部知识库".into() }
                 )
             }
         }
         ApiCommand::Key {
             action: KeyCommand::Revoke { .. },
         } => println!("API Key 已撤销"),
+        ApiCommand::Key {
+            action: KeyCommand::SetScope { .. },
+        } => println!("API Key 访问范围已更新"),
         ApiCommand::Web { action: WebCommand::Code } => println!("{}", value["code"].as_str().unwrap()),
         _ => {
             println!(
@@ -246,6 +297,10 @@ pub fn run(command: &ApiCommand) -> Result<()> {
             }
             if matches!(command, ApiCommand::Status { .. } | ApiCommand::Web { .. }) {
                 println!("网页服务：{}", if value["web_running"] == true {"运行中"} else {"未运行"});
+                println!("网页访问码：{}", if value["web_access_code_required"] == false {"已关闭（可直接进入）"} else {"已开启"});
+                if let Some(url) = value["web_external_url"].as_str() {
+                    println!("外部访问地址：{url}");
+                }
             }
             if matches!(command, ApiCommand::Status { .. }) {
                 println!("本机 MCP：{}", value["mcp_local_url"].as_str().unwrap());

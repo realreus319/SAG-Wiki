@@ -39,6 +39,8 @@ npm run build:cli
 
 前者生成 debug CLI，后者生成 release CLI。开发产物放在 `src-tauri/bin/development/`，正式产物放在 `src-tauri/bin/`；macOS 产物会执行签名步骤。
 
+桌面端和 CLI 打包时，会从仓库的 `third-party/pdfium/` 读取对应平台的 PDFium 压缩包，校验 SHA-256 后将运行库和许可文件放入安装包。这个步骤无需联网下载 PDFium。
+
 需要把当前构建安装到用户终端时，显式执行：
 
 ```sh
@@ -100,15 +102,22 @@ SAG_DATA_DIR=/path/to/dev-data ./src-tauri/bin/development/sag service status
 
 改动说明见[更新日志](/zh/docs/updates)。安装包以最新正式发布为准。发布前须在同一提交上通过前端、文档及 macOS/Windows 构建，并核对安装升级、已有索引保留、分阶段状态和失败重试；标签与桌面端、CLI 版本必须一致。
 
-产品 PR 合并前须在 `CHANGELOG.md` 的明确版本号标题（如 `## 0.3.4`）下追加面向用户的中文变更条目，并在 `### English` 下按相同顺序追加对应英文条目；每项使用单行 `- ` 列表。已发布条目保留在实际发布版本下，不使用未发布占位标题。PR 检查会拒绝产品改动缺少、未更新或仍使用占位标题的发布说明；明确标记 `release:skip` 的内部改动除外，纯文档、CI 和发布工具改动无需产品条目。版本记录只编辑根目录 `CHANGELOG.md`，运行 `npm --prefix docs-site run changelog:generate` 生成双语更新日志，不直接修改生成页。`npm --prefix docs-site run changelog:lint` 在所有 PR 中检查所有版本，纯文档 PR 也不跳过；PR 检查、新标签准备和草稿正式发布会拒绝缺失或不一致的条目，文档构建成功不能替代此检查。 构建产物包含 `docs-version.json`。实际部署后检出预期提交，运行 `npm --prefix docs-site run verify:deployment -- --url https://your-docs-host.example --expected-sha <完整提交SHA> --release v0.3.5`，核对版本信息与双语页面内容标记。此命令供实际部署流程调用，不引入托管平台或桌面新版本。
+产品 PR 合并前须在 `CHANGELOG.md` 的明确版本号标题（如 `## 0.3.4`）下追加面向用户的中文变更条目，并在 `### English` 下按相同顺序追加对应英文条目；每项使用单行 `- ` 列表。已发布条目保留在实际发布版本下，不使用未发布占位标题。PR 检查会拒绝产品改动缺少、未更新或仍使用占位标题的发布说明；明确标记 `release:skip` 的内部改动除外，纯文档、CI 和发布工具改动无需产品条目。版本记录只编辑根目录 `CHANGELOG.md`，运行 `npm --prefix docs-site run changelog:generate` 生成双语更新日志，不直接修改生成页。`npm --prefix docs-site run changelog:lint` 在所有 PR 中检查所有版本，纯文档 PR 也不跳过；PR 检查、新标签准备和草稿正式发布会拒绝缺失或不一致的条目，文档构建成功不能替代此检查。 `docs-site` 可单独构建，不依赖上层目录或 Git。完整仓库的发布流程先运行 `node scripts/documentation-release.mjs build`，再构建文档，产物包含 `docs-version.json`。实际部署后检出预期提交，运行 `npm --prefix docs-site run verify:deployment -- --url https://your-docs-host.example --expected-sha <完整提交SHA> --release v0.3.5`，核对版本信息与双语页面内容标记。此命令供实际部署流程调用，不引入托管平台或桌面新版本。
 
 功能条目后可附对应的 Issue 和 PR Markdown 链接，例如 `修复公式显示。（[PR #142](https://github.com/Zleap-AI/SAG-Wiki/pull/142)）`；中英文条目均可保留这些链接。链接用于关联改动，不能代替功能描述；仍禁止提交标题、提交哈希和提交链接。
 
-编写条目前先获取远程版本标签，以自动流程计算的下一版本号建立标题；版本冲突时在合并前调整标题。自动准备沿用该版本的已审核说明，并在独立发布提交中统一应用、CLI 和锁文件的版本，不改写主分支的日志标题。说明缺失或格式无效时，在创建 tag 前停止。发布页和更新提示仅包含中英文功能改动，不生成提交标题、提交引用、自动发布套话或签名迁移附加段落。
+编写条目前先获取远程版本标签，以自动流程计算的下一版本号建立标题；版本冲突时在合并前调整标题。自动准备沿用该版本的已审核说明，并在独立发布提交中统一应用、CLI 和锁文件的版本，不改写主分支的日志标题。说明缺失或格式无效时，在创建 tag 前停止。应用内更新提示仅包含中英文功能改动；GitHub 发布页另附 Windows x64、Apple Silicon 和 Intel 安装包下载表。不生成提交标题、提交引用、自动发布套话或签名迁移附加段落。
 
 ## 自动构建与发布
 
-main 的产品改动自动准备一致的版本元数据，生成发布子提交和 tag，完成必要检查后自动签名、公证并正式发布。纯文档、CI 和发布工具调整不发版，不需要逐版人工审批。Rust 原生测试与正式编译保持并行；macOS 安装包构建与包内检查通过后即可签名，不等待 Rust 测试，最终发布仍要求两平台、前端、文档及制品检查通过。重试接续同一版本和已验证阶段。现有仓库须由管理员一次性迁移 release 环境后启用自动发布，详见[发布与恢复指南](https://github.com/Zleap-AI/SAG-Wiki/blob/main/docs/zh-CN/应用内更新发布.md)。
+main 的产品改动自动准备一致的版本元数据，生成发布子提交和 tag，完成必要检查后自动签名、公证并正式发布。纯文档、CI 和发布工具调整不发版，不需要逐版人工审批。Rust 原生测试与正式编译保持并行；macOS 安装包构建与包内检查通过后即可签名，不等待 Rust 测试，最终发布仍要求三个平台、前端、文档及制品检查通过。重试接续同一版本和已验证阶段。现有仓库须由管理员一次性迁移 release 环境后启用自动发布，详见[发布与恢复指南](https://github.com/Zleap-AI/SAG-Wiki/blob/main/docs/zh-CN/应用内更新发布.md)。
+
+
+发布效率：前端资源在同一源码上构建一次，供 Windows x64、Apple Silicon 和 Intel 安装包共享；本地构建仍可独立执行。两个 Mac 签名任务分别等待各自构建完成，不占用 Mac 运行器轮询，也不等待其他平台。原生构建仅暂存 App 归档，签名阶段才制作最终 DMG；旧版含临时 DMG 的检查点仍可恢复。正式发布不再额外构建 Safari 开发安装包；Safari 原生保存测试仍保留。签名后的更新包与 DMG 保留内容、身份、票据和签名校验，相同二进制只执行一次完整 Jev E2E。
+
+原生 Rust 测试仅在全部原生源码、测试、依赖、配置及编译环境与上一成功正式版一致，且已核实该版三平台原生任务全部成功时复用。输入有变化、基线不可验证或查询失败时，三平台均运行完整原生单元与集成测试；Python、Safari 原生保存和最终生产安装包检查仍执行。排除不参与安装包的性能探针示例编译，并避免重复执行同一 CLI 进程回归测试。复用结果的轻量任务在 Ubuntu 上记录，不申请 Mac 运行器；Python 和 Safari 原生保存检查在对应平台的生产构建中执行。不增加必需检查或审批。
+
+每次正式 Release 都包含 Windows x64 EXE、Apple Silicon DMG 和 Intel DMG，以及相应更新资源；任一平台缺失时，现有组装和发布检查会阻止发布。Release 正文直接列出三个安装包下载链接；应用内更新说明仍只显示功能变更。
 
 可信 tag 任务会导出仅包含 Rust 依赖的缓存，供后续版本复用，并校验仓库、源码、最新任务 attempt、兼容性和摘要。缓存排除应用与测试可执行文件、本地 SAG 库，保留 14 天；兼容键只忽略本地包版本变化。缓存未命中时正常编译，全部必要测试和安装包检查继续执行。分支 CI 使用独立验证命名空间测量归档开销，不签名或发布。
 

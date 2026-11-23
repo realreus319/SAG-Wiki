@@ -5,10 +5,10 @@ import {chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync}
 import {tmpdir} from 'node:os';
 import {join, resolve} from 'node:path';
 import {spawnSync} from 'node:child_process';
-import {validateRun, latestJob, componentState, selectArtifact, selectComponent, validateReceipt, verifyArchive, awaitComponents, components, releaseComponents} from './release-build-cache.mjs';
+import {validateRun, latestJob, componentState, selectArtifact, selectComponent, validateReceipt, verifyArchive, awaitComponents, components, releaseComponents, releaseJobTimings} from './release-build-cache.mjs';
 const commit = 'a'.repeat(40);
 const ctx = {commit, workflowId:4, currentRunId:20};
-const names = {documentation:'Build bilingual documentation', frontend:'Test frontend', 'rust-macos':'Test Rust macos', 'rust-windows':'Test Rust windows', 'build-macos':'Build macos', 'build-windows':'Build windows'};
+const names = {'rust-macos-intel':'Test Rust macos-intel','build-macos-intel':'Build macos-intel', documentation:'Build bilingual documentation', frontend:'Test frontend', 'rust-macos':'Test Rust macos', 'rust-windows':'Test Rust windows', 'build-macos':'Build macos', 'build-windows':'Build windows'};
 const run = (id=10, patch={}) => ({id, repository:{id:3, full_name:'Zleap-AI/SAG-Wiki'}, head_repository:{full_name:'Zleap-AI/SAG-Wiki'}, head_sha:commit, workflow_id:4, path:'.github/workflows/desktop-release.yml', head_branch:'main', event:'push', status:'completed', conclusion:'success', ...patch});
 const job = (name, id=1, patch={}) => ({id, name, conclusion:'success', status:'completed', run_attempt:1, started_at:'2026-01-01T00:00:00Z', completed_at:'2026-01-01T00:10:00Z', ...(name.startsWith('Compile CLI ')?{steps:[{name:'Compile the production CLI with its real embedded web assets',conclusion:'success'}]}:{}), ...patch});
 const artifact = (sourceRun, platform, sourceJob, patch={}) => ({id:100+sourceRun.id, name:`desktop-${platform}-${commit}-${sourceJob.run_attempt}`, expired:false, expires_at:'2099-01-01T00:00:00Z', created_at:'2026-01-01T00:05:00Z', digest:`sha256:${'b'.repeat(64)}`, workflow_run:{id:sourceRun.id, head_sha:commit, repository_id:3, head_repository_id:3}, ...patch});
@@ -16,10 +16,20 @@ function source(id=10, patch={}) {
  const sourceRun=run(id,patch);
  const jobs=[job('Validate release source',id*100), ...components.map((c,i)=>job(names[c],id*100+i+1))];
  const receipts=Object.fromEntries(components.map((c,i)=>[c,{schema:1,commit,component:c,producer_run:id,producer_job:jobs[i+1].id,producer_attempt:1}]));
- return {run:sourceRun,jobs,receipts,artifacts:['macos','windows'].map(p=>artifact(sourceRun,p,jobs.find(j=>j.name===`Build ${p}`)))};
+ return {run:sourceRun,jobs,receipts,artifacts:['macos','windows','macos-intel'].map(p=>artifact(sourceRun,p,jobs.find(j=>j.name===`Build ${p}`)))};
 }
 const receiptReader=(s,c)=>s.receipts[c];
 const choose=(sources,c,options={})=>selectComponent(sources,c,{...ctx,receiptReader,...options});
+
+test('release timing summary separates queue time and execution and uses the latest job attempt', () => {
+ const first=job('Test Rust macos-intel',1,{created_at:'2025-12-31T23:55:00Z'});
+ const retry=job('Test Rust macos-intel',2,{run_attempt:2,created_at:'2025-12-31T23:59:57Z'});
+ const noQueue=job('Build windows',3);
+ assert.deepEqual(releaseJobTimings([first,retry,noQueue]),[
+  '| Test Rust macos-intel | 2 | 3 | 600 |',
+  '| Build windows | 1 | — | 600 |',
+ ]);
+});
 
 test('signing can start after the verified macOS build while native tests remain pending',async()=>{
  const s=source(20,{status:'in_progress',conclusion:null});
@@ -162,18 +172,28 @@ test('mocked gh CLI reuses an older failed tag platform, ignores newer runs and 
  }finally{rmSync(directory,{recursive:true,force:true});}
 });
 
-test('workflow has independent native stages, one protected signing deployment and checked automatic publication',()=>{
- const workflow=readFileSync(new URL('../.github/workflows/desktop-release.yml',import.meta.url),'utf8');
- for(const name of ['Test Rust macos','Test Rust windows','Build macos','Build windows'])assert.match(workflow,new RegExp(`job_name: ${name}`));
- assert.equal((workflow.match(/^    environment:$/gm)||[]).length,1);
+test('both Mac architectures reuse parallel native builds and signing before existing assembly',()=>{
+ const workflow=readFileSync(new URL('../.github/workflows/desktop-release.yml',import.meta.url),'utf8').replace(/\r\n/g,'\n');
+ for(const name of ['Test Rust macos','Test Rust macos-intel','Test Rust windows','Build macos','Build macos-intel','Build windows','Compile CLI macos-intel'])assert.ok(workflow.includes(`job_name: ${name}`));
+ const signing=workflow.slice(workflow.indexOf('\n  sign-macos:'),workflow.indexOf('\n  release:'));
+ assert.match(signing,/needs: \[validate, build-macos\]/);
+ assert.match(signing,/needs: \[validate, build-macos-intel\]/);
+ assert.ok(signing.indexOf('release-build-cache.mjs wait')<signing.indexOf('APPLE_CERTIFICATE_BASE64'));
+ assert.match(signing,/runner: macos-15-intel/);assert.match(signing,/fail-fast: false/);
+ assert.ok(signing.includes('name: desktop-${{ matrix.platform }}-signed-${{ github.sha }}\n'));
+ assert.match(signing,/overwrite: true/);
+ const network=signing.slice(signing.indexOf('      - name: Use TCP for Apple'),signing.indexOf('      - name: Sign, notarize'));
+ assert.match(network,/if: matrix.platform == 'macos-intel'/);
+ assert.match(network,/proto udp from any to any port 443/);
+ assert.match(network,/sudo pfctl -E/);
  const release=workflow.slice(workflow.indexOf('\n  release:'));
- assert.match(release,/needs: validate/);assert.doesNotMatch(release,/needs:.*(?:native|frontend|documentation)/);
- assert.ok(release.indexOf('wait macos')<release.indexOf('APPLE_CERTIFICATE_BASE64'));
- assert.ok(release.indexOf('APPLE_CERTIFICATE_BASE64')<release.indexOf('wait all'));
+ assert.ok(release.includes('pattern: desktop-*-signed-${{ github.sha }}\n'));
+ assert.ok(!release.includes('signed-${{ github.sha }}-${{ github.run_attempt }}'));
+ assert.match(release,/needs: \[validate, sign-macos, sign-macos-intel\]/);
+ assert.match(release,/runs-on: ubuntu-24.04/);
  assert.ok(release.indexOf('wait all')<release.indexOf('TAURI_SIGNING_PRIVATE_KEY'));
- assert.match(release,/automatic-release\.mjs create-draft/);assert.match(workflow,/needs: \[validate, release\]/);assert.match(workflow,/checkpoint-\$\{\{ matrix.component \}\}/);
- assert.match(workflow,/desktop-\$\{\{ matrix.platform \}\}-\$\{\{ github.sha \}\}-\$\{\{ github.run_attempt \}\}/);
- assert.doesNotMatch(workflow.slice(0,workflow.indexOf('\n  release:')),/secrets\.|contents: write|id-token: write/);
+ assert.match(release,/automatic-release\.mjs create-draft/);assert.match(workflow,/needs: \[validate, release\]/);
+ assert.doesNotMatch(workflow.slice(0,workflow.indexOf('\n  sign-macos:')),/secrets\.|contents: write|id-token: write/);
 });
 
 test('parallel build receipts bind the CLI compiler and reject superseding failed or pending attempts',()=>{
@@ -217,4 +237,35 @@ test('PR E2E bounds outer test capacity while retaining the complete CLI suite',
  assert.match(e2e,/RUST_TEST_THREADS:\s*['"]?2['"]?(?:\s|$)/);
  assert.match(e2e,/run: cargo test --locked --manifest-path cli\/Cargo.toml\s*\n/);
  assert.doesNotMatch(e2e,/--skip|--ignored/);
+});
+
+test('Intel signing readiness is independent of ARM builds and tests while using its own checkpoint', async () => {
+ const s=source(20,{status:'in_progress',conclusion:null});
+ for(const name of ['Build macos','Test Rust macos-intel','Build windows'])Object.assign(s.jobs.find(j=>j.name===name),{status:'in_progress',conclusion:null});
+ const result=await awaitComponents(ctx,releaseComponents('macos-intel'),{gate:true,snapshot:()=>[s],receiptReader,pause:()=>{throw new Error('Intel signing waited for another architecture');}});
+ assert.deepEqual(result.map(r=>r.artifact?.platform),['macos-intel']);
+});
+
+test('retained successful job copies resolve to their actual artifact-producing execution', () => {
+ const s=source(20); const c='build-macos-intel';
+ const original=s.jobs.find(j=>j.name===names[c]);
+ original.steps=[{name:'Build',status:'completed',conclusion:'success',started_at:original.started_at,completed_at:original.completed_at}];
+ const copied={...original,id:99001,run_attempt:2};s.jobs.push(copied);
+ assert.equal(latestJob(s.jobs,names[c]).id,original.id);
+ assert.equal(choose([s],c,{gate:true}).artifact.name,`desktop-macos-intel-${commit}-1`);
+ // A real rerun, even one with no new artifact yet, must supersede the old success.
+ copied.started_at='2026-01-02T00:00:00Z';copied.completed_at='2026-01-02T00:10:00Z';
+ assert.equal(latestJob(s.jobs,names[c]).id,copied.id);
+ assert.throws(()=>choose([s],c,{gate:true}),/superseded|artifact|checkpoint job/);
+ copied.conclusion='failure';assert.throws(()=>choose([s],c,{gate:true}),/checkpoint failed/);
+ copied.conclusion=null;copied.status='in_progress';assert.equal(choose([s],c,{gate:true}).state,'pending');
+});
+
+test('retained CLI copies preserve compiler receipt identity without masking new executions', () => {
+ const s=source(20), compiler=job('Compile CLI macos-intel',8801);
+ compiler.steps[0].started_at=compiler.started_at;compiler.steps[0].completed_at=compiler.completed_at;
+ s.jobs.push(compiler,{...compiler,id:8802,run_attempt:2});
+ s.receipts['build-macos-intel']={...s.receipts['build-macos-intel'],schema:2,cli_producer:{run:20,job:8801,attempt:1}};
+ assert.equal(choose([s],'build-macos-intel',{gate:true}).state,'success');
+ s.jobs.at(-1).conclusion='failure';assert.throws(()=>choose([s],'build-macos-intel',{gate:true}),/CLI compiler/);
 });

@@ -10,7 +10,7 @@ use crate::{ignore_rules, text, types::*};
 use crate::index_status::IndexOutcome;
 use anyhow::{bail, Context, Result};
 use indexmap::IndexMap;
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{hash_map::Entry as MapEntry, HashMap, HashSet},
@@ -27,6 +27,7 @@ use std::{
 const TEXT_PREPARATION_BUDGET: usize = 512 * 1024 * 1024;
 // Persisted by walk_entry so file-only recovery can distinguish directory errors.
 const DIRECTORY_READ_ERROR_PREFIX: &str = "无法读取目录：";
+const WATCH_LIMIT_ERROR: &str = "max_files_watch";
 const MIN_TEXT_PREPARATION_BYTES: usize = 64 * 1024 * 1024;
 #[cfg(test)]
 const MAX_TEXT_INPUT_BYTES: usize = 16 * 1024 * 1024;
@@ -341,12 +342,28 @@ fn register_rank(connection: &Connection) -> Result<()> {
     connection.pragma_update(None, "mmap_size", 2_147_483_648_i64)?;
     Ok(())
 }
+fn is_official_update_repository(value: &str) -> bool {
+    reqwest::Url::parse(value.trim()).is_ok_and(|url| {
+        url.scheme() == "https" && url.host_str() == Some("github.com")
+            && url.port().is_none() && url.username().is_empty() && url.password().is_none()
+            && url.path().trim_matches('/').split_once('/').is_some_and(|(owner, repo)| {
+                owner.eq_ignore_ascii_case("Zleap-AI")
+                    && repo.strip_suffix(".git").unwrap_or(repo).eq_ignore_ascii_case("SAG-Wiki")
+            })
+    })
+}
+
+fn follows_official_update_language(config: &UpdateSettings) -> bool {
+    config.follow_language && config.website_url == OFFICIAL_UPDATE_MANIFEST
+        && is_official_update_repository(&config.github_url)
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let db = Connection::open(path)?;
+        let mut db = Connection::open(path)?;
         // Check before journal setup, CREATE/ALTER statements or data migrations:
         // an older application must leave a newer database untouched.
         let schema_version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -364,6 +381,24 @@ impl Store {
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
  CREATE TABLE IF NOT EXISTS roots(path TEXT PRIMARY KEY,name TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',error TEXT);
  CREATE TABLE IF NOT EXISTS chat_imports(identity TEXT PRIMARY KEY,path TEXT NOT NULL,output_hash TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS agent_artifact_settings(id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS agent_artifact_items(id TEXT PRIMARY KEY, stamp TEXT NOT NULL, digest TEXT, path TEXT, archive_digest TEXT);
+ CREATE TABLE IF NOT EXISTS online_sources(id TEXT PRIMARY KEY, config TEXT NOT NULL, next_at INTEGER);
+ CREATE TABLE IF NOT EXISTS online_items(source TEXT NOT NULL REFERENCES online_sources(id) ON DELETE CASCADE, id TEXT NOT NULL, version TEXT NOT NULL, files TEXT NOT NULL, PRIMARY KEY(source,id));
+ CREATE TABLE IF NOT EXISTS online_api_records(
+   entry INTEGER PRIMARY KEY AUTOINCREMENT,
+   source TEXT NOT NULL REFERENCES online_sources(id) ON DELETE CASCADE,
+   day TEXT NOT NULL, dedup_key TEXT, fields TEXT, markdown TEXT
+ );
+ CREATE INDEX IF NOT EXISTS online_api_pending ON online_api_records(source,entry) WHERE fields IS NOT NULL;
+ CREATE UNIQUE INDEX IF NOT EXISTS online_api_dedup ON online_api_records(source,day,dedup_key) WHERE dedup_key IS NOT NULL;
+ CREATE TABLE IF NOT EXISTS online_api_writes(
+   source TEXT REFERENCES online_sources(id) ON DELETE CASCADE,
+   day TEXT, before_hash TEXT, after_hash TEXT NOT NULL, entries TEXT NOT NULL,
+   PRIMARY KEY(source,day)
+ );
+ CREATE TABLE IF NOT EXISTS online_runs(id INTEGER PRIMARY KEY, source TEXT NOT NULL REFERENCES online_sources(id) ON DELETE CASCADE, started INTEGER NOT NULL, finished INTEGER, result TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS chat_import_schedules(source TEXT PRIMARY KEY,enabled INTEGER NOT NULL,time TEXT NOT NULL,source_root TEXT,include_tools INTEGER NOT NULL,configured_at INTEGER NOT NULL,last_run_at INTEGER,last_run TEXT,interval_minutes INTEGER);
  CREATE TABLE IF NOT EXISTS root_watch_errors(root TEXT PRIMARY KEY REFERENCES roots(path) ON DELETE CASCADE,error TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS root_exclusions(path TEXT PRIMARY KEY,root TEXT NOT NULL REFERENCES roots(path) ON DELETE CASCADE);
  CREATE TABLE IF NOT EXISTS index_issues(path TEXT PRIMARY KEY,root TEXT NOT NULL REFERENCES roots(path) ON DELETE CASCADE,error TEXT NOT NULL);
@@ -475,10 +510,43 @@ impl Store {
             db.pragma_update(None, "user_version", 10)?;
         }
         let storage = if schema_version == 0 { ConversionStorage::AppData } else { ConversionStorage::Library };
-        db.execute("INSERT OR IGNORE INTO preferences VALUES(1,?)", [serde_json::json!({"conversion_storage":storage}).to_string()])?;
+        let transaction = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let has_import_interval: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('chat_import_schedules') WHERE name='interval_minutes')",
+            [], |row| row.get(0),
+        )?;
+        if !has_import_interval {
+            transaction.execute("ALTER TABLE chat_import_schedules ADD COLUMN interval_minutes INTEGER", [])?;
+        }
+        transaction.execute("INSERT OR IGNORE INTO preferences VALUES(1,?)", [serde_json::json!({"conversion_storage":storage,"update_source_migrated":true}).to_string()])?;
+        let mut saved: String = transaction.query_row("SELECT value FROM preferences WHERE id=1", [], |row| row.get(0))?;
+        let mut preferences: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&saved)?;
+        if preferences.get("update_source_migrated").and_then(serde_json::Value::as_bool) != Some(true) {
+            if let Some(config) = preferences.get_mut("updates") {
+                let previous: UpdateSettings = serde_json::from_value(config.clone())?;
+                if matches!(previous.source, UpdateSource::Github)
+                    && is_official_update_repository(&previous.github_url)
+                    && matches!(previous.website_url.trim(), "" | OFFICIAL_UPDATE_MANIFEST)
+                {
+                    config["source"] = "github".into();
+                    config["website_url"] = OFFICIAL_UPDATE_MANIFEST.into();
+                    config["follow_language"] = true.into();
+                }
+            } else {
+                preferences.insert("updates".into(), serde_json::to_value(UpdateSettings {
+                    source: UpdateSource::Github,
+                    ..UpdateSettings::default()
+                })?);
+            }
+            preferences.insert("update_source_migrated".into(), true.into());
+            saved = serde_json::to_string(&preferences)?;
+            transaction.execute("UPDATE preferences SET value=? WHERE id=1", [&saved])
+                .context("无法保存更新源迁移结果")?;
+        }
+        let previous: Settings = serde_json::from_str(&saved)?;
+        transaction.commit()?;
         // Slots are cheap; open read connections only when a configured worker is used.
         let query_readers = Arc::new((0..64).map(|_| Mutex::new(None)).collect());
-        let saved: Option<String> = db.query_row("SELECT value FROM preferences WHERE id=1", [], |r| r.get(0)).optional()?;
         let store = Self {
             indexing: crate::index_status::IndexControl::default(),
             docling: Arc::new(crate::docling::Docling::new(&path.canonicalize()?.parent().unwrap())),
@@ -492,15 +560,12 @@ impl Store {
             deferred_refresh: Arc::new(Mutex::new(HashSet::new())),
             conversion_storage_access: Arc::new(RwLock::new(())),
         };
-        if let Some(saved) = saved {
-            let previous: Settings = serde_json::from_str(&saved)?;
-            if previous.retrieval_version < crate::sag2_v10::VERSION {
-                let updated = store.settings()?;
-                if previous.retrieval.chunk_chars != updated.retrieval.chunk_chars {
-                    store.invalidate_index()?;
-                }
-                store.save_settings(&updated)?;
+        if previous.retrieval_version < crate::sag2_v10::VERSION {
+            let updated = store.settings()?;
+            if previous.retrieval.chunk_chars != updated.retrieval.chunk_chars {
+                store.invalidate_index()?;
             }
+            store.save_settings(&updated)?;
         }
         *store.runtime.write().expect("runtime settings poisoned") = store.settings()?.runtime;
         Ok(store)
@@ -560,18 +625,27 @@ impl Store {
             },
             None => Settings::default(),
         };
-        settings.mineru.enabled = settings.document_parser != Some(DocumentParser::Docling)
+        if follows_official_update_language(&settings.updates) {
+            settings.updates.source = UpdateSource::Website;
+        }
+        settings.mineru.enabled = matches!(settings.document_parser, None | Some(DocumentParser::Mineru))
             && crate::mineru::has_key(self.docling.data_directory(), &settings.mineru)?;
+        // The proxy password is kept with the model keys and only attached in memory.
+        settings.model_proxy = settings.model_proxy
+            .with_stored_password(crate::models::proxy_password(self.docling.data_directory())?);
         Ok(settings)
     }
     pub fn validate_settings(s: &Settings) -> Result<()> {
         s.runtime.validate().map_err(anyhow::Error::msg)?;
+        crate::model_http::validate_proxy(&s.model_proxy)?;
         if s.answer.auth_mode != ModelAuthMode::Bearer {
             bail!("问答模型需要 API Key 鉴权；无需鉴权选项仅适用于 Jev")
         }
         anyhow::ensure!(s.search_summary_sources > 0, "自动问答参考数量必须大于 0");
         anyhow::ensure!(s.search_summary_model.is_empty() || s.answer.models.contains(&s.search_summary_model), "总结模型必须从可选问答模型中选择");
-        if !matches!(s.language.as_str(), "zh-CN" | "en") {
+        anyhow::ensure!(s.document_parser != Some(DocumentParser::Vision)
+            || (!s.document_parser_model.is_empty() && s.answer.models.contains(&s.document_parser_model)), "解析模型必须从可选问答模型中选择");
+        if !sag_protocol::locales::supports_interface_language(&s.language) {
             bail!("不支持的界面语言")
         }
         if s.max_tool_calls > 100 {
@@ -640,9 +714,34 @@ impl Store {
             settings.conversion_storage = self.validate_conversion_storage(&settings.conversion_storage)?;
             self.prepare_conversion_migration(&previous.conversion_storage, &settings.conversion_storage)?
         } else { Vec::new() };
+        // Older CLIs discard the locale policy fields when rewriting preferences.
+        // Persist the recognizable GitHub defaults so reopening can restore the policy.
+        if follows_official_update_language(&settings.updates) {
+            settings.updates.source = UpdateSource::Github;
+        }
+        // A typed proxy password goes to credentials.json; the preferences row never stores it.
+        // Turning authentication off sends an empty password, which removes the stored one;
+        // a cleared username on its own keeps it, so a slip never discards a secret.
+        settings.model_proxy.url = settings.model_proxy.url.trim().to_owned();
+        settings.model_proxy.username = settings.model_proxy.username.trim().to_owned();
+        settings.model_proxy.bypass = settings.model_proxy.bypass.trim().to_owned();
+        let data_dir = self.docling.data_directory();
+        let typed = settings.model_proxy.password.as_deref();
+        if settings.model_proxy.username.is_empty() {
+            if settings.model_proxy.mode == ProxyMode::Custom && typed.is_some_and(|value| !value.is_empty()) {
+                bail!("请填写代理用户名")
+            }
+            if typed == Some("") && previous.model_proxy.has_password {
+                crate::models::save_proxy_password(data_dir, None)?;
+            }
+        } else if let Some(password) = typed.filter(|value| !value.is_empty()) {
+            crate::models::save_proxy_password(data_dir, Some(password))?;
+        }
+        settings.model_proxy.password = None;
+        settings.model_proxy.stored_password = None;
         let mut db = self.connection();
         let transaction = db.transaction()?;
-        transaction.execute("INSERT INTO preferences VALUES(1,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value",[serde_json::to_string(&settings)?])?;
+        transaction.execute("INSERT INTO preferences VALUES(1,json_set(?, '$.update_source_migrated', json('true'))) ON CONFLICT(id) DO UPDATE SET value=excluded.value",[serde_json::to_string(&settings)?])?;
         if previous.file_types != s.file_types || previous.excluded != s.excluded || previous.convert_other_formats != s.convert_other_formats || previous.conversion_formats != s.conversion_formats {
             transaction.execute("UPDATE metadata SET version=version+1", [])?;
         }
@@ -691,7 +790,7 @@ impl Store {
         if options.convert_other_formats
             && (!previous.convert_other_formats || previous.conversion_formats != options.conversion_formats)
         {
-            self.docling.require_formats(&crate::conversion::local_formats(&options.conversion_formats,&self.settings()?.mineru))?;
+            self.docling.require_formats(&crate::conversion::local_formats(&options.conversion_formats,&self.settings()?))?;
         }
         let root = self.roots()?.into_iter().find(|root| path.starts_with(&root.path)).unwrap().path;
         let mut db = self.connection();
@@ -768,7 +867,11 @@ impl Store {
             DELETE FROM drafts;
             DELETE FROM preferences;
             DELETE FROM chat_imports;
-            INSERT INTO preferences VALUES(1,'{\"conversion_storage\":{\"mode\":\"app_data\"}}');
+            DELETE FROM agent_artifact_settings;
+            DELETE FROM agent_artifact_items;
+            DELETE FROM online_sources;
+            DELETE FROM chat_import_schedules;
+            INSERT INTO preferences VALUES(1,'{\"conversion_storage\":{\"mode\":\"app_data\"},\"update_source_migrated\":true}');
             DELETE FROM chunk_fts;
             DELETE FROM documents;
             DELETE FROM index_issues;
@@ -860,42 +963,43 @@ impl Store {
                 "资料文件夹不能包含自定义转换结果目录");
         }
         if !path.is_dir() && !path.is_file() { bail!("请选择文件或文件夹") }
-        let roots = self.roots()?;
-        if let Some(r) = roots.iter().find(|r| path.starts_with(&r.path)) {
-            let value = path_text(&path)?;
-            let mut db = self.connection();
-            let tx = db.transaction()?;
+        let value = path_text(&path)?;
+        let mut db = self.connection();
+        let tx = db.transaction()?;
+        let roots: Vec<String> = {
+            let mut query = tx.prepare("SELECT path FROM roots ORDER BY rowid")?;
+            let rows = query.query_map([], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        if let Some(root) = roots.iter().find(|root| path.starts_with(root)) {
             tx.execute("DELETE FROM root_exclusions WHERE path=?", [&value])?;
             if Self::path_excluded(&tx, &value)? { bail!("请先重新添加已移除的上级目录") }
             tx.commit()?;
-            return Ok(r.path.clone());
+            return Ok(root.clone());
         };
         if !path.is_dir() {
             bail!("请选择文件夹")
         };
-        let value = path_text(&path)?;
         let name = path
             .file_name()
             .unwrap_or(path.as_os_str())
             .to_string_lossy();
-        let mut c = self.connection();
-        let tx = c.transaction()?;
         tx.execute(
             "INSERT INTO roots(path,name) VALUES(?,?)",
             params![value, name],
         )?;
-        for r in roots
+        for root in roots
             .iter()
-            .filter(|r| Path::new(&r.path).starts_with(&path))
+            .filter(|root| Path::new(root).starts_with(&path))
         {
             tx.execute(
                 "UPDATE documents SET root=? WHERE root=?",
-                params![value, r.path],
+                params![value, root],
             )?;
-            tx.execute("UPDATE index_issues SET root=? WHERE root=?", params![value, r.path])?;
-            tx.execute("UPDATE conversion_failures SET root=? WHERE root=?", params![value, r.path])?;
-            tx.execute("UPDATE root_exclusions SET root=? WHERE root=?", params![value, r.path])?;
-            tx.execute("DELETE FROM roots WHERE path=?", [&r.path])?;
+            tx.execute("UPDATE index_issues SET root=? WHERE root=?", params![value, root])?;
+            tx.execute("UPDATE conversion_failures SET root=? WHERE root=?", params![value, root])?;
+            tx.execute("UPDATE root_exclusions SET root=? WHERE root=?", params![value, root])?;
+            tx.execute("DELETE FROM roots WHERE path=?", [root])?;
         }
         tx.commit()?;
         Ok(value)
@@ -1130,12 +1234,23 @@ impl Store {
         )?;
         Ok(())
     }
-    pub(crate) fn set_watch_error(&self, root: &str, error: Option<&str>) -> Result<()> {
+    pub(crate) fn set_watch_error(&self, root: &str, error: Option<&notify::Error>) -> Result<()> {
         let db = self.connection();
         match error {
-            Some(error) => { db.execute("INSERT INTO root_watch_errors(root,error) SELECT path,?2 FROM roots WHERE path=?1 ON CONFLICT(root) DO UPDATE SET error=excluded.error", params![root,error])?; },
+            Some(error) => {
+                let detail = if matches!(error.kind, notify::ErrorKind::MaxFilesWatch) { WATCH_LIMIT_ERROR.into() } else { error.to_string() };
+                db.execute("INSERT INTO root_watch_errors(root,error) SELECT path,?2 FROM roots WHERE path=?1 ON CONFLICT(root) DO UPDATE SET error=excluded.error", params![root,detail])?;
+            },
             None => { db.execute("DELETE FROM root_watch_errors WHERE root=?", [root])?; },
         }
+        Ok(())
+    }
+    pub(crate) fn record_watch_limit(&self, root: &str) -> Result<()> {
+        self.set_watch_error(root, Some(&notify::Error::new(notify::ErrorKind::MaxFilesWatch)))?;
+        let settled: bool = self.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM roots WHERE path=? AND status IN ('ready','partial'))", [root], |row| row.get(0),
+        )?;
+        if settled { self.reconcile_finished_root(root)?; }
         Ok(())
     }
     fn finish_indexing(&self, root: &str) -> Result<()> {
@@ -1166,7 +1281,12 @@ impl Store {
                 .map(|(path, error)| format!("{path}\n{error}")).collect::<Vec<_>>().join("\n\n")) };
             if let Some(error) = watch_error {
                 if !details.is_empty() { details.push_str("\n\n"); }
-                details.push_str(&format!("文件监听失败，自动更新受限；请在索引设置中重建索引以重试。\n{error}"));
+                if error == WATCH_LIMIT_ERROR || error == "OS file watch limit reached."
+                    || (error.starts_with("OS file watch limit reached. about [") && error.ends_with(']')) {
+                    details.push_str(crate::indexer::WATCH_LIMIT_HINT);
+                } else {
+                    details.push_str(&format!("文件监听失败，自动更新受限；请在索引设置中重建索引以重试。\n{error}"));
+                }
             }
             self.root_status(root, "partial", Some(&details))
         }
@@ -4086,6 +4206,107 @@ while [ ! -f "$(dirname "$0")/release" ]; do sleep 0.02; done
     }
 
     #[test]
+    fn update_source_migration_preserves_legacy_configuration_and_runs_once() {
+        use serde_json::json;
+        let official = OFFICIAL_UPDATE_GITHUB;
+        let cases = [
+            (None, true),
+            (Some(json!({})), true),
+            (Some(json!({"source":"github","github_url":official,"website_url":""})), true),
+            (Some(json!({"source":"github","github_url":"https://github.com/zleap-ai/sag-wiki.git/","website_url":OFFICIAL_UPDATE_MANIFEST})), true),
+            (Some(json!({"github_url":"https://github.com/customer/SAG-Wiki"})), false),
+            (Some(json!({"github_url":"https://github.com/Zleap-AI/SAG-Wiki-fork"})), false),
+            (Some(json!({"github_url":"https://github.com.example.org/Zleap-AI/SAG-Wiki"})), false),
+            (Some(json!({"github_url":"https://github.com/Zleap-AI/SAG-Wiki/releases"})), false),
+            (Some(json!({"website_url":"https://example.com/custom.json"})), false),
+            (Some(json!({"source":"website","website_url":"https://example.com/custom.json"})), false),
+            (Some(json!({"source":"website","website_url":OFFICIAL_UPDATE_MANIFEST})), false),
+            (Some(json!({"source":"github","github_url":official,"website_url":"https://example.com/custom.json"})), false),
+        ];
+        for (previous, migrate) in cases {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("settings.sqlite");
+            let store = Store::open(&path).unwrap();
+            let mut preferences = json!({"language":"en", "theme":"dark", "retrieval_version":crate::sag2_v10::VERSION,
+                "jev":{"url":"https://example.com/model"}, "future_preference":{"value":true}});
+            if let Some(previous) = &previous { preferences["updates"] = previous.clone(); }
+            store.connection().execute("UPDATE preferences SET value=? WHERE id=1", [preferences.to_string()]).unwrap();
+            drop(store);
+
+            let store = Store::open(&path).unwrap();
+            let settings = store.settings().unwrap();
+            let raw: String = store.connection().query_row("SELECT value FROM preferences WHERE id=1", [], |row| row.get(0)).unwrap();
+            let mut raw: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(raw.as_object_mut().unwrap().remove("update_source_migrated"), Some(json!(true)));
+            if migrate {
+                assert!(settings.updates.follow_language);
+                assert!(matches!(settings.updates.source, UpdateSource::Website));
+                assert_eq!(settings.updates.website_url, OFFICIAL_UPDATE_MANIFEST);
+                assert_eq!(settings.updates.github_url, previous.as_ref().and_then(|value| value["github_url"].as_str()).unwrap_or(official));
+            } else {
+                assert_eq!(raw["updates"], previous.unwrap());
+                assert!(!settings.updates.follow_language);
+                assert_eq!(matches!(settings.updates.source, UpdateSource::Website), raw["updates"]["source"] == "website");
+            }
+            raw.as_object_mut().unwrap().remove("updates");
+            preferences.as_object_mut().unwrap().remove("updates");
+            assert_eq!(raw, preferences);
+            store.connection().execute_batch("CREATE TRIGGER forbid_repeat_migration BEFORE UPDATE ON preferences BEGIN SELECT RAISE(ABORT, 'migration repeated'); END;").unwrap();
+            drop(store);
+            assert_eq!(Store::open(&path).unwrap().settings().unwrap().updates.follow_language, migrate);
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.sqlite");
+        let store = Store::open(&path).unwrap();
+        let mut settings = store.settings().unwrap();
+        assert!(settings.updates.follow_language);
+        assert_eq!(settings.updates.website_url, OFFICIAL_UPDATE_MANIFEST);
+        settings.language = "en".into();
+        store.save_settings(&settings).unwrap();
+        assert!(store.settings().unwrap().updates.follow_language);
+        // An older CLI rewrites preferences using only the fields it understands.
+        store.connection().execute(
+            "UPDATE preferences SET value=json_set(
+                json_remove(value, '$.updates.follow_language', '$.update_source_migrated'),
+                '$.jev.model', 'legacy-cli-model'
+            ) WHERE id=1", [],
+        ).unwrap();
+        drop(store);
+
+        let store = Store::open(&path).unwrap();
+        let mut settings = store.settings().unwrap();
+        assert!(settings.updates.follow_language, "the old CLI must not disable language-based updates");
+        assert!(matches!(settings.updates.source, UpdateSource::Website));
+        assert_eq!(settings.language, "en");
+        assert_eq!(settings.jev.model, "legacy-cli-model");
+        settings.updates = serde_json::from_value(json!({"source":"github","github_url":official})).unwrap();
+        store.save_settings(&settings).unwrap();
+        store.connection().execute_batch("CREATE TRIGGER forbid_extra_update BEFORE UPDATE ON preferences BEGIN SELECT RAISE(ABORT, 'unexpected write'); END;").unwrap();
+        drop(store);
+        let reopened = Store::open(&path).unwrap().settings().unwrap();
+        assert!(matches!(reopened.updates.source, UpdateSource::Github));
+        assert!(!reopened.updates.follow_language);
+        assert_eq!(reopened.language, "en");
+    }
+
+    #[test]
+    fn update_source_migration_reports_write_failure_without_marking_completion() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.sqlite");
+        let store = Store::open(&path).unwrap();
+        let old = r#"{"updates":{"source":"github"}}"#;
+        store.connection().execute("UPDATE preferences SET value=? WHERE id=1", [old]).unwrap();
+        store.connection().execute_batch("CREATE TRIGGER reject_migration BEFORE UPDATE ON preferences BEGIN SELECT RAISE(ABORT, 'migration blocked'); END;").unwrap();
+        drop(store);
+        let error = Store::open(&path).err().expect("failed migration must prevent startup");
+        assert!(error.to_string().contains("无法保存更新源迁移结果"));
+        assert!(format!("{error:#}").contains("migration blocked"));
+        let saved: String = Connection::open(&path).unwrap().query_row("SELECT value FROM preferences WHERE id=1", [], |row| row.get(0)).unwrap();
+        assert_eq!(saved, old);
+    }
+
+    #[test]
     fn interface_language_persists_and_old_settings_default_to_chinese() {
         let (_dir, store, _) = setup();
         let mut settings = store.settings().unwrap();
@@ -4093,9 +4314,14 @@ while [ ! -f "$(dirname "$0")/release" ]; do sleep 0.02; done
         settings.language = "en".into();
         store.save_settings(&settings).unwrap();
         assert_eq!(store.settings().unwrap().language, "en");
+        for language in ["ja", "zh-TW", "ko", "es"] {
+            settings.language = language.into();
+            store.save_settings(&settings).unwrap();
+            assert_eq!(store.settings().unwrap().language, language);
+        }
         settings.language = "unsupported".into();
         assert!(store.save_settings(&settings).is_err());
-        assert_eq!(store.settings().unwrap().language, "en");
+        assert_eq!(store.settings().unwrap().language, "es");
         let mut legacy = serde_json::to_value(Settings::default()).unwrap();
         legacy.as_object_mut().unwrap().remove("language");
         let restored: Settings = serde_json::from_value(legacy).unwrap();
@@ -4136,7 +4362,7 @@ while [ ! -f "$(dirname "$0")/release" ]; do sleep 0.02; done
     fn model_profiles_and_tool_limit_persist_and_validate() {
         let (_dir, store, _) = setup();
         let mut settings = store.settings().unwrap();
-        assert_eq!(settings.max_tool_calls, 0);
+        assert_eq!(settings.max_tool_calls, 20);
         settings.mcp_servers.push(McpServer {
             id: "wiki".into(),
             name: "Wiki".into(),
@@ -4239,6 +4465,7 @@ while [ ! -f "$(dirname "$0")/release" ]; do sleep 0.02; done
     fn delete_and_restore_message_keeps_the_rest_of_the_conversation() {
         let (_dir, store, _) = setup();
         let message = Message {
+            help: false,
             created_at: Some(1_792_368_300_000),
             question: "第一问".into(),
             answer: "第一答".into(),

@@ -1,4 +1,5 @@
 mod cli_commands;
+mod data_directory;
 mod share;
 mod note_import;
 mod folder_picker;
@@ -49,6 +50,7 @@ fn output_value(output: Output) -> CommandResult<serde_json::Value> {
     use Output::*;
     let value = match output {
         ChatCatalog(value) => serde_json::to_value(value).map_err(error)?,
+        ChatImportSchedule(value) => serde_json::to_value(value).map_err(error)?,
         ChatPreview(value) => serde_json::to_value(value).map_err(error)?,
         ChatImports(value) => serde_json::to_value(value).map_err(error)?,
         Api(value) => value,
@@ -130,7 +132,7 @@ macro_rules! remote {
         async fn $name($($arg:$ty,)+state:State<'_,Arc<AppState>>)->CommandResult<serde_json::Value>{rpc(&state,Operation::$variant{$($arg),+}).await}
     };
 }
-/// Connects to the service once at startup and localizes the tray menu.
+/// Connects to the service once at startup to prepare the default library.
 ///
 /// Connection failures are reported to the window instead of aborting
 /// setup: a stale service record, an older daemon that is still running,
@@ -139,7 +141,7 @@ macro_rules! remote {
 fn connect_on_startup(state: Arc<AppState>, fresh_library: bool) {
     tauri::async_runtime::spawn(async move {
         match rpc(&state, Operation::GetSettings).await {
-            Ok(value) => {
+            Ok(_) => {
                 if fresh_library {
                     let result = async {
                         let documents = dirs::document_dir().ok_or("无法获取文稿目录")?;
@@ -149,26 +151,75 @@ fn connect_on_startup(state: Arc<AppState>, fresh_library: bool) {
                     }.await;
                     if let Err(error) = result { emit(&state.app, "app-error", error); }
                 }
-                if let Some(language) = value.get("language").and_then(|v| v.as_str()) {
-                    if let Some(tray) = state.app.tray_by_id("main") {
-                        match tray_menu(&state.app, language) {
-                            Ok(menu) => {
-                                if let Err(e) = tray.set_menu(Some(menu)) {
-                                    eprintln!("更新托盘菜单失败：{e}");
-                                }
-                            }
-                            Err(e) => eprintln!("构建托盘菜单失败：{e}"),
-                        }
-                    }
-                }
             }
             Err(error) => eprintln!("启动时连接 SAG 服务失败：{error:#}"),
         }
     });
 }
+struct InterfaceLanguage {
+    announced: String,
+    tray: String,
+}
+
+impl InterfaceLanguage {
+    fn new() -> Self {
+        let default = protocol::locales::default_interface_language();
+        Self {
+            announced: default.into(),
+            tray: default.into(),
+        }
+    }
+}
+
+fn apply_interface_language<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    applied_language: &Mutex<InterfaceLanguage>,
+    language: String,
+) {
+    let refresh_tray = applied_language.lock().unwrap().tray != language;
+    if refresh_tray {
+        if let Some(tray) = app.tray_by_id("main") {
+            match tray_menu(app, &language).and_then(|menu| tray.set_menu(Some(menu))) {
+                Ok(()) => applied_language.lock().unwrap().tray.clone_from(&language),
+                Err(error) => eprintln!("Could not update the tray menu: {error}"),
+            }
+        }
+    }
+    let mut applied = applied_language.lock().unwrap();
+    if applied.announced != language {
+        applied.announced.clone_from(&language);
+        drop(applied);
+        emit(app, "interface-language-changed", language);
+    }
+}
+
+async fn refresh_interface_language<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    client: Client,
+    applied_language: Arc<Mutex<InterfaceLanguage>>,
+    mut changes: tokio::sync::watch::Receiver<()>,
+) {
+    while changes.changed().await.is_ok() {
+        let response = client.call(Operation::GetSettings, Duration::from_secs(2)).await;
+        match changes.has_changed() {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(_) => break,
+        }
+        match response {
+            Ok(Output::Settings(settings)) => {
+                apply_interface_language(&app, &applied_language, settings.language);
+            }
+            Ok(_) => eprintln!("Unexpected settings response while refreshing the interface language"),
+            Err(error) => eprintln!("Could not load the interface language: {error}"),
+        }
+    }
+}
+
 fn forward_events<R: tauri::Runtime>(state: Arc<AppState<R>>) -> tauri::async_runtime::JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
         let mut reported: Option<String> = None;
+        let applied_language = Arc::new(Mutex::new(InterfaceLanguage::new()));
         loop {
             if state.quitting.load(Ordering::Relaxed) {
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -212,17 +263,26 @@ fn forward_events<R: tauri::Runtime>(state: Arc<AppState<R>>) -> tauri::async_ru
                 }
             }
             let mut events = client.subscribe();
-            if let Err(error) = client
-                .call(Operation::Snapshot, Duration::from_secs(30))
-                .await
-            {
-                emit(
-                    &state.app,
-                    "app-error",
-                    format!("无法恢复 SAG 状态：{error:#}"),
-                );
-                continue;
-            }
+            let language = match client.call(Operation::Snapshot, Duration::from_secs(30)).await {
+                Ok(Output::Snapshot(snapshot)) => snapshot.settings.language,
+                Ok(_) => {
+                    emit(&state.app, "app-error", "无法恢复 SAG 状态：快照响应无效");
+                    continue;
+                }
+                Err(error) => {
+                    emit(&state.app, "app-error", format!("无法恢复 SAG 状态：{error:#}"));
+                    continue;
+                }
+            };
+            apply_interface_language(&state.app, &applied_language, language);
+            let (language_refresh, changes) = tokio::sync::watch::channel(());
+            let mut language_worker = tokio::task::JoinSet::new();
+            language_worker.spawn(refresh_interface_language(
+                state.app.clone(),
+                client.clone(),
+                applied_language.clone(),
+                changes,
+            ));
             emit(&state.app, "data-changed", ());
             emit(&state.app, "history-changed", ());
             emit(&state.app, "settings-changed", ());
@@ -230,7 +290,10 @@ fn forward_events<R: tauri::Runtime>(state: Arc<AppState<R>>) -> tauri::async_ru
                 match events.recv().await {
                     Ok(envelope) => match envelope.event {
                         ServiceEvent::DataChanged => emit(&state.app, "data-changed", ()),
-                        ServiceEvent::SettingsChanged => emit(&state.app, "settings-changed", ()),
+                        ServiceEvent::SettingsChanged => {
+                            emit(&state.app, "settings-changed", ());
+                            let _ = language_refresh.send(());
+                        }
                         ServiceEvent::HistoryChanged => emit(&state.app, "history-changed", ()),
                         ServiceEvent::IndexProgress(value) => {
                             emit(&state.app, "index-progress", value)
@@ -252,6 +315,8 @@ fn forward_events<R: tauri::Runtime>(state: Arc<AppState<R>>) -> tauri::async_ru
                     },
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         emit(&state.app, "data-changed", ());
+                        emit(&state.app, "settings-changed", ());
+                        let _ = language_refresh.send(());
                     }
                     Err(error) => {
                         emit(
@@ -263,6 +328,7 @@ fn forward_events<R: tauri::Runtime>(state: Arc<AppState<R>>) -> tauri::async_ru
                     }
                 }
             }
+            language_worker.shutdown().await;
         }
     })
 }
@@ -275,23 +341,23 @@ fn show_main_window(app: &tauri::AppHandle) -> tauri::Result<()> {
     window.unminimize()?;
     window.set_focus()
 }
-fn tray_menu(app: &tauri::AppHandle, language: &str) -> tauri::Result<Menu<tauri::Wry>> {
-    let english = language == "en";
+fn tray_menu<R: tauri::Runtime>(app: &tauri::AppHandle<R>, language: &str) -> tauri::Result<Menu<R>> {
+    let labels = &protocol::locales::interface_locale(language).tray;
     let open = MenuItem::with_id(
         app,
         "sag-open",
-        if english { "Open SAG Wiki" } else { "打开 SAG Wiki" },
+        &labels.open,
         true,
         None::<&str>,
     )?;
     let quit = MenuItem::with_id(
         app,
         "sag-quit",
-        if english { "Quit SAG Wiki" } else { "退出 SAG Wiki" },
+        &labels.quit,
         true,
         None::<&str>,
     )?;
-    let quick = MenuItem::with_id(app, "sag-quick-search", if english { "Quick Search" } else { "快捷搜索" }, true, None::<&str>)?;
+    let quick = MenuItem::with_id(app, "sag-quick-search", &labels.quick_search, true, None::<&str>)?;
     Menu::with_items(app, &[&quick, &open, &quit])
 }
 #[tauri::command]
@@ -315,7 +381,6 @@ async fn quit_application(app: tauri::AppHandle, state: State<'_, Arc<AppState>>
     Ok(())
 }
 
-#[cfg(any(test, not(target_os = "macos")))]
 async fn stop_background<R: tauri::Runtime>(state: &AppState<R>) -> CommandResult<()> {
     // Block automatic startup/reconnect before requesting shutdown. Reuse the
     // reconnect lock so an already-starting service is stopped as well.
@@ -341,6 +406,7 @@ remote!(list_roots() => ListRoots);
 remote!(list_entries(path:String) => ListEntries);
 remote!(list_files() => ListFiles);
 remote!(read_document(path:String) => ReadDocument);
+remote!(read_help_document(path:String) => ReadHelpDocument);
 remote!(explore_overview(scope:String,query:String,visible:Vec<i64>) => ExploreOverview);
 remote!(explore_graph(scope:String,request_id:String) => ExploreGraph);
 remote!(explore_neighbors(scope:String,center_id:i64,snapshot:Option<String>,offset:usize,request_id:String) => ExploreNeighbors);
@@ -363,6 +429,21 @@ remote!(set_index_paused(paused:bool) => SetIndexPaused);
 remote!(remove_all_roots() => RemoveAllRoots);
 remote!(save_document(path:String,body:String,expected_hash:Option<String>) => SaveDocument);
 remote!(get_chat_import_folder() => GetChatImportFolder);
+remote!(online_import(action:sag_protocol::online_import::Action) => OnlineImport);
+remote!(agent_artifacts(action:sag_protocol::agent_artifacts::Action) => AgentArtifacts);
+#[tauri::command]
+async fn choose_artifact_directory(app: tauri::AppHandle, title: String) -> CommandResult<Option<String>> {
+    use tauri_plugin_dialog::DialogExt;
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(folder) = app.dialog().file().set_title(title).blocking_pick_folder() else {
+            return Ok(None);
+        };
+        let path = folder.into_path().map_err(error)?.canonicalize().map_err(error)?;
+        Ok(Some(path.to_string_lossy().into_owned()))
+    }).await.map_err(error)?
+}
+remote!(get_chat_import_schedule(source:sag_protocol::ChatSource) => GetChatImportSchedule);
+remote!(save_chat_import_schedule(source:sag_protocol::ChatSource,schedule:sag_protocol::ChatImportSchedule) => SaveChatImportSchedule);
 #[tauri::command]
 async fn choose_chat_import_folder(state: State<'_, Arc<AppState>>) -> CommandResult<Option<String>> {
     use tauri_plugin_dialog::DialogExt;
@@ -398,11 +479,12 @@ remote!(cancel_docling_install() => CancelDoclingInstall);
 remote!(uninstall_docling() => UninstallDocling);
 remote!(clear_model_key(kind:String) => ClearModelKey);
 remote!(mineru_schema() => MineruSchema);
-remote!(test_mineru(config:sag_protocol::mineru::MineruConfig,key:String) => TestMineru);
+remote!(test_mineru(config:sag_protocol::mineru::MineruConfig,key:String,model_proxy:Option<ModelProxy>) => TestMineru);
 remote!(clear_mineru_key(config:sag_protocol::mineru::MineruConfig) => ClearMineruKey);
 remote!(runtime_schema() => RuntimeSchema);
-remote!(test_model(kind:String,config:ModelConfig,key:String) => TestModel);
-remote!(list_answer_models(config:ModelConfig,key:String) => ListAnswerModels);
+remote!(test_model(kind:String,config:ModelConfig,key:String,model_proxy:Option<ModelProxy>) => TestModel);
+remote!(test_proxy_connection(proxy:ModelProxy) => TestProxyConnection);
+remote!(list_answer_models(config:ModelConfig,key:String,model_proxy:Option<ModelProxy>) => ListAnswerModels);
 remote!(test_mcp(server:McpServer,credentials:Option<McpCredentials>) => TestMcp);
 remote!(resolve_tool_approval(id:String,allow:bool) => ResolveToolApproval);
 remote!(list_conversations() => ListConversations);
@@ -429,10 +511,8 @@ async fn save_settings(
     mineru_key: Option<String>,
     mcp_credentials: Option<std::collections::BTreeMap<String, McpCredentials>>,
     state: State<'_, Arc<AppState>>,
-    app: tauri::AppHandle,
 ) -> CommandResult<serde_json::Value> {
-    let language = settings.language.clone();
-    let result = rpc(
+    rpc(
         &state,
         Operation::SaveSettings {
             settings,
@@ -442,12 +522,7 @@ async fn save_settings(
             mcp_credentials,
         },
     )
-    .await?;
-    app.tray_by_id("main")
-        .unwrap()
-        .set_menu(Some(tray_menu(&app, &language).map_err(error)?))
-        .map_err(error)?;
-    Ok(result)
+    .await
 }
 #[tauri::command]
 async fn reveal_path(path: String, state: State<'_, Arc<AppState>>) -> CommandResult<()> {
@@ -603,7 +678,22 @@ pub fn run() {
         .setup(|app| {
             #[cfg(windows)]
             windows_icon::set_taskbar_icon(app.get_webview_window("main").unwrap().hwnd()?)?;
-            let data = protocol::data_dir()?;
+            tauri::async_runtime::spawn(async {
+                loop {
+                    if let Err(error) = sag_client::share::history() {
+                        eprintln!("清理过期分享记录失败：{error:#}");
+                    }
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+            });
+            let data = match protocol::data_dir() {
+                Ok(data) => data,
+                Err(failure) => {
+                    app.get_webview_window("main").unwrap().hide()?;
+                    data_directory::recover_at_startup(app.handle(), error(failure));
+                    return Ok(());
+                }
+            };
             quick_search::initialize(app.handle(), &data)?;
             let fresh_library = !data.join("sag.sqlite").try_exists()?;
             let cli_install_error = cli_commands::initialize_cli(app.handle()).err();
@@ -611,7 +701,7 @@ pub fn run() {
                 .map_err(anyhow::Error::msg)?;
             // The service is connected asynchronously by `connect_on_startup`
             // and on demand by `rpc`; the tray starts with the default language.
-            let language = "zh-CN";
+            let language = protocol::locales::default_interface_language();
             let icon = app.default_window_icon().unwrap().clone();
             #[cfg(target_os = "macos")]
             let icon = {
@@ -705,6 +795,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             share::prepare_share, share::upload_share, share::close_share, share::receive_share,
             share::get_share_settings, share::save_share_settings, share::share_clipboard,
+            share::get_share_history, share::cancel_share,
             note_import::choose_note_import_folder,
             note_import::open_full_disk_access,
             note_import::prepare_note_import,
@@ -736,6 +827,7 @@ pub fn run() {
             folder_picker::browse_folders,
             list_files,
             read_document,
+            read_help_document,
             explore_overview,
             explore_graph,
             explore_neighbors,
@@ -759,10 +851,15 @@ pub fn run() {
             remove_all_roots,
             save_document,
             get_chat_import_folder,
+            agent_artifacts,
+            choose_artifact_directory,
+            get_chat_import_schedule,
+            save_chat_import_schedule,
             choose_chat_import_folder,
             list_chat_sessions,
             preview_chat_import,
             import_chat_sessions,
+            online_import,
             save_note,
             list_notes,
             get_note,
@@ -801,9 +898,12 @@ pub fn run() {
             open_source_file,
             reveal_docling_log,
             open_data_directory,
+            data_directory::get_data_directory,
+            data_directory::migrate_data_directory,
             open_about_link,
             open_external_link,
             updates::check_app_update,
+            test_proxy_connection,
             updates::download_app_update,
             updates::install_app_update,
             load_image,

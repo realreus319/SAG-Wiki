@@ -14,7 +14,8 @@ const digest = path => createHash('sha256').update(readFileSync(path)).digest('h
 const external = (command, args, options = {}) => {
   const result = spawnSync(command, args, {cwd: root, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, ...options});
   // Arguments and command output may contain credentials. Never include them in errors.
-  assert.equal(result.status, 0, `${basename(command)} failed (exit ${result.status ?? 'unavailable'})`);
+  const operation = command === 'xcrun' ? ['notarytool submit', 'stapler staple', 'stapler validate'].find(name => name === `${args[0]} ${args[1]}`) : undefined;
+  assert.equal(result.status, 0, `${basename(command)}${operation ? ` ${operation}` : ''} failed (exit ${result.status ?? 'unavailable'})`);
   return {stdout: result.stdout ?? '', stderr: result.stderr ?? ''};
 };
 
@@ -99,27 +100,28 @@ function appContents(app) {
 
 const isMachO = path => lstatSync(path).isFile() && ['feedface', 'cefaedfe', 'feedfacf', 'cffaedfe', 'cafebabe', 'bebafeca', 'cafebabf', 'bfbafeca'].includes(readFileSync(path).subarray(0, 4).toString('hex'));
 
-export function signMacosRelease({input = 'release-artifacts', output = 'signed-release-artifacts'} = {}, {run: commandRunner = external, environment = process.env, platform = process.platform, arch = process.arch} = {}) {
+export function signMacosRelease({input = 'release-artifacts', output = 'signed-release-artifacts', 'release-platform': releasePlatform = 'macos'} = {}, {run: commandRunner = external, environment = process.env, platform = process.platform, arch = process.arch} = {}) {
   const credentials = validateAppleCredentials(environment);
   assert.equal(platform, 'darwin', 'Apple release signing requires macOS');
-  assert.equal(arch, 'arm64', 'Apple release signing requires native arm64 Node.js');
+  const architecture = releasePlatform === 'macos-intel' ? 'x86_64' : 'arm64';
+  assert.equal(arch, releasePlatform === 'macos-intel' ? 'x64' : 'arm64', `Apple release signing requires native ${architecture} Node.js`);
   const childEnvironment = {...process.env};
   for (const name of credentialNames) delete childEnvironment[name];
   const run = (command, args, options = {}) => commandRunner(command, args, {env: childEnvironment, ...options});
-  assert.equal(run('uname', ['-m']).stdout.trim(), 'arm64', 'Apple release signing requires an arm64 host');
+  assert.equal(run('uname', ['-m']).stdout.trim(), architecture, `Apple release signing requires an ${architecture} host`);
   const version = validateVersions();
   const commit = run('git', ['rev-parse', 'HEAD']).stdout.trim();
   if (environment.GITHUB_SHA) assert.equal(commit, environment.GITHUB_SHA, 'Checkout must match the triggering commit');
   const source = resolve(input);
   const destination = resolve(output);
-  const original = validateStagedArtifacts(source, version, commit, ['macos']).macos;
+  const original = validateStagedArtifacts(source, version, commit, [releasePlatform])[releasePlatform];
   assert.ok(!existsSync(destination), 'Signed release output must be fresh');
   assert.ok(destination !== source && !destination.startsWith(source + '/'), 'Signed output must be outside the source staging directory');
   mkdirSync(dirname(destination), {recursive: true});
   const temporary = mkdtempSync(join(dirname(destination), '.sag-apple-signing-'));
   chmodSync(temporary, 0o700);
   const prepared = join(temporary, 'prepared');
-  const signed = join(prepared, 'macos');
+  const signed = join(prepared, releasePlatform);
   const extraction = join(temporary, 'extracted');
   const app = join(extraction, appName);
   const cli = join(app, 'Contents/Resources/bin/sag');
@@ -128,13 +130,13 @@ export function signMacosRelease({input = 'release-artifacts', output = 'signed-
   let keychainCreated = false;
   let searchListChanged = false;
   let originalSearchList = [];
-  const filenames = Object.keys(original.files);
-  const dmgName = filenames.find(name => name.endsWith('.dmg'));
-  const archiveName = filenames.find(name => name.endsWith('.app.tar.gz'));
+  const archiveName = Object.keys(original.files).find(name => name.endsWith('.app.tar.gz'));
+  const dmgName = `SAG-Wiki-${version}-macOS-${releasePlatform==='macos'?'arm64':'x86_64'}.dmg`;
+  const filenames = [archiveName,dmgName];
   try {
     mkdirSync(signed, {recursive: true});
     mkdirSync(extraction);
-    extractAppArchive(join(source, 'macos', archiveName), extraction, run);
+    extractAppArchive(join(source, releasePlatform, archiveName), extraction, run);
     assert.ok(isMachO(cli), 'Bundled resource CLI must be a regular Mach-O executable');
     assert.ok(isMachO(join(app, 'Contents/MacOS/sag-desktop')), 'Desktop must be a regular Mach-O executable');
     try {
@@ -160,7 +162,7 @@ export function signMacosRelease({input = 'release-artifacts', output = 'signed-
       };
       // Resources/bin/sag is not a standard nested-code location: enumerate Mach-O files explicitly.
       for (const path of walk(app).filter(isMachO).sort((a, b) => b.split('/').length - a.split('/').length)) {
-        run('lipo', [path, '-verify_arch', 'arm64']);
+        run('lipo', [path, '-verify_arch', architecture]);
         sign(path);
       }
       for (const path of walk(app).filter(path => lstatSync(path).isDirectory() && /\.(?:app|framework|xpc|appex)$/.test(path)).sort((a, b) => b.length - a.length)) sign(path);
@@ -201,7 +203,7 @@ export function signMacosRelease({input = 'release-artifacts', output = 'signed-
       mkdirSync(updaterExtraction);
       run('tar', ['-xzf', archive, '-C', updaterExtraction], {env: archiveEnvironment});
       const updaterApp = join(updaterExtraction, appName);
-      const acceptApp = acceptedApp => {
+      const acceptApp = (acceptedApp, {full = true} = {}) => {
         const acceptedCli = join(acceptedApp, 'Contents/Resources/bin/sag');
         run('xcrun', ['stapler', 'validate', acceptedApp]);
         verify(acceptedCli);
@@ -210,7 +212,7 @@ export function signMacosRelease({input = 'release-artifacts', output = 'signed-
         const identity = JSON.parse(run(acceptedCli, ['--build-info']).stdout);
         assert.deepEqual(identity, original.build_identity, 'Packaged CLI build identity differs from the staged release');
         run('python3', [join(root, 'tests/desktop_bundle_test.py')], {env: {...childEnvironment, SAG_DESKTOP_BUNDLE: acceptedApp}});
-        run('python3', [join(root, 'tests/local-jev-e2e.py'), '--binary', acceptedCli]);
+        if (full) run('python3', [join(root, 'tests/local-jev-e2e.py'), '--binary', acceptedCli]);
       };
       assert.deepEqual(appContents(updaterApp), appContents(app), 'Updater archive differs from the stapled app, including code signatures');
       acceptApp(updaterApp);
@@ -222,7 +224,9 @@ export function signMacosRelease({input = 'release-artifacts', output = 'signed-
         run('hdiutil', ['attach', '-readonly', '-nobrowse', '-mountpoint', mount, dmg]);
         const mountedApp = join(mount, appName);
         assert.deepEqual(appContents(mountedApp), appContents(updaterApp), 'DMG app differs from the extracted updater app, including code signatures');
-        acceptApp(mountedApp);
+        // The DMG contains the exact already-tested app, signatures and ticket.
+        // Retain mounted-bundle, identity and launch checks without rerunning E2E.
+        acceptApp(mountedApp, {full:false});
       } finally {
         if (attachAttempted) run('hdiutil', ['detach', mount]);
       }
@@ -242,7 +246,7 @@ export function signMacosRelease({input = 'release-artifacts', output = 'signed-
     }
     assert.ok(!existsSync(destination), 'Signed release output must be fresh');
     renameSync(prepared, destination);
-    return JSON.parse(readFileSync(join(destination, 'macos/metadata.json'), 'utf8'));
+    return JSON.parse(readFileSync(join(destination, releasePlatform, 'metadata.json'), 'utf8'));
   } finally {
     rmSync(temporary, {recursive: true, force: true});
   }
@@ -250,7 +254,7 @@ export function signMacosRelease({input = 'release-artifacts', output = 'signed-
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   try {
-    const {values} = parseArgs({options: {input: {type: 'string'}, output: {type: 'string'}}});
+    const {values} = parseArgs({options: {input: {type: 'string'}, output: {type: 'string'}, 'release-platform': {type:'string'}}});
     signMacosRelease(values);
     console.log(`Signed and notarized macOS release verified at ${resolve(values.output ?? 'signed-release-artifacts')}`);
   } catch (error) {

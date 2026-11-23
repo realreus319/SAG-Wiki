@@ -9,8 +9,8 @@ import {validateStagedArtifacts, validateVersions} from './release.mjs';
 
 const repository = 'Zleap-AI/SAG-Wiki';
 const workflow = '.github/workflows/desktop-release.yml';
-export const components = ['documentation', 'frontend', 'rust-macos', 'rust-windows', 'build-macos', 'build-windows'];
-const jobNames = {documentation:'Build bilingual documentation', frontend:'Test frontend', 'rust-macos':'Test Rust macos', 'rust-windows':'Test Rust windows', 'build-macos':'Build macos', 'build-windows':'Build windows'};
+export const components = ['documentation', 'frontend', 'rust-macos', 'rust-windows', 'rust-macos-intel', 'build-macos-intel', 'build-macos', 'build-windows'];
+const jobNames = {'rust-macos-intel':'Test Rust macos-intel', 'build-macos-intel':'Build macos-intel', documentation:'Build bilingual documentation', frontend:'Test frontend', 'rust-macos':'Test Rust macos', 'rust-windows':'Test Rust windows', 'build-macos':'Build macos', 'build-windows':'Build windows'};
 const gh = (...args) => {
   const result = spawnSync('gh', args, {encoding:'utf8', maxBuffer:16 * 1024 * 1024, timeout:60000});
   assert.equal(result.status, 0, `GitHub request failed: ${result.stderr}`);
@@ -39,7 +39,19 @@ export function latestJob(jobs, name) {
   const latest = Math.max(...candidates.map(job => job.run_attempt));
   const matches = candidates.filter(job => job.run_attempt === latest);
   assert.equal(matches.length, 1, `Duplicate job: ${name}`);
-  return matches[0];
+  const current = matches[0];
+  // GitHub copies retained successful jobs into later attempts with new IDs.
+  // Their execution and step timestamps stay unchanged; their artifacts and
+  // receipts still belong to the original job, not to the copied API record.
+  if (current.status === 'completed' && current.conclusion === 'success' &&
+      current.started_at && current.completed_at && current.steps?.length &&
+      current.steps.every(step => step.started_at && step.completed_at)) {
+    const execution = job => JSON.stringify([job.started_at, job.completed_at,
+      job.steps?.map(step => [step.name, step.status, step.conclusion, step.started_at, step.completed_at])]);
+    const retained = candidates.filter(job => job.status === 'completed' && job.conclusion === 'success' && execution(job) === execution(current));
+    return retained.reduce((original, job) => job.run_attempt < original.run_attempt ? job : original, current);
+  }
+  return current;
 }
 
 export function compilerJobMode(job) {
@@ -222,14 +234,17 @@ export function selectComponent(sources, component, {currentRunId, gate = false,
 }
 
 const sleep = milliseconds => new Promise(done => setTimeout(done, milliseconds));
-export async function awaitComponents(ctx, requested, {gate, timeoutMs = 95 * 60 * 1000, pollMs = 60000, snapshot = snapshots, pause = sleep, receiptReader = readReceipt} = {}) {
+export async function awaitComponents(ctx, requested, {gate, timeoutMs = 95 * 60 * 1000, pollMs = 60000, snapshot = snapshots, pause = sleep, receiptReader = readReceipt, onReady} = {}) {
   assert.ok(Number.isSafeInteger(timeoutMs) && timeoutMs >= 0 && timeoutMs <= 210 * 60 * 1000, 'Invalid wait timeout');
   assert.ok(Number.isSafeInteger(pollMs) && pollMs > 0 && pollMs <= 60000, 'Invalid poll interval');
   const deadline = Date.now() + timeoutMs;
   while (true) {
     const sources = snapshot(ctx, gate);
     const results = requested.map(component => ({component, ...selectComponent(sources, component, {...ctx, gate, receiptReader})}));
-    if (results.every(result => result.state === 'success')) return results;
+    if (results.every(result => result.state === 'success')) {
+      onReady?.(sources);
+      return results;
+    }
     if (!gate && results.some(result => result.state === 'failure')) return results;
     assert.ok(!results.some(result => result.state === 'failure'), `No verified source for: ${results.filter(r => r.state === 'failure').map(r => r.component).join(', ')}`);
     assert.ok(Date.now() < deadline, `Timed out waiting for: ${results.filter(r => r.state === 'pending').map(r => r.component).join(', ')}`);
@@ -270,8 +285,22 @@ async function probeComponent(component) {
 }
 
 export function releaseComponents(platform) {
-  assert.ok(['macos', 'all'].includes(platform), 'Use wait macos or wait all');
-  return platform === 'macos' ? ['build-macos'] : components;
+  assert.ok(['macos', 'macos-intel', 'all'].includes(platform), 'Use wait macos, macos-intel or all');
+  return platform === 'all' ? components : [`build-${platform}`];
+}
+
+export function releaseJobTimings(jobs) {
+  const names = ['Validate release source', ...Object.values(jobNames),
+    'Compile CLI macos', 'Compile CLI macos-intel', 'Compile CLI windows', 'Sign macos', 'Sign macos-intel'];
+  return names.flatMap(name => {
+    const job = latestJob(jobs,name);
+    if (!job) return [];
+    const difference = (end,start) => {
+      const milliseconds = Date.parse(end) - Date.parse(start);
+      return Number.isFinite(milliseconds) && milliseconds >= 0 ? (milliseconds/1000).toFixed(0) : '—';
+    };
+    return [`| ${name} | ${job.run_attempt} | ${difference(job.started_at,job.created_at)} | ${difference(job.completed_at,job.started_at)} |`];
+  });
 }
 
 async function waitForRelease(platform) {
@@ -280,19 +309,37 @@ async function waitForRelease(platform) {
   const budget = Number(process.env.RELEASE_WAIT_TIMEOUT_MS ?? 210 * 60 * 1000);
   assert.ok(Number.isSafeInteger(budget) && budget >= 0 && budget <= 210 * 60 * 1000, 'Invalid wait timeout');
   const deadlinePath = '.release-wait-deadline';
-  if (platform === 'macos') writeFileSync(deadlinePath, String(Date.now() + budget));
+  if (platform !== 'all' || !existsSync(deadlinePath)) writeFileSync(deadlinePath, String(Date.now() + budget));
   assert.ok(existsSync(deadlinePath), 'Missing macOS release checkpoint deadline');
   const deadline = Number(readFileSync(deadlinePath, 'utf8'));
   assert.ok(Number.isSafeInteger(deadline), 'Invalid release checkpoint deadline');
+  let currentJobs = [];
+  const waitStartedAt = Date.now();
   const results = await awaitComponents(ctx, requested, {gate:true,
     timeoutMs: Math.max(0, Math.min(budget, deadline - Date.now())),
-    pollMs: Number(process.env.RELEASE_WAIT_POLL_MS ?? 60000)});
+    pollMs: Number(process.env.RELEASE_WAIT_POLL_MS ?? 20000),
+    onReady: sources => { currentJobs = sources.find(source => source.run.id === ctx.currentRunId)?.jobs ?? []; }});
+  const checkpointsReadyAt = Date.now();
   const artifacts = results.flatMap(result => result.artifact ? [result.artifact] : []);
-  // After Apple signing, preserve the exact original macOS input; final gating
-  // rechecks provenance, but downloads only the still-missing Windows input.
-  downloadArtifacts(artifacts.filter(a => platform === 'macos' || a.platform === 'windows'), 'release-artifacts');
-  validateStagedArtifacts(resolve('release-artifacts'), validateVersions(), ctx.commit, platform === 'macos' ? ['macos'] : ['macos', 'windows']);
+  // Signing and assembly run in separate jobs, each with fresh artifact inputs.
+  downloadArtifacts(artifacts, 'release-artifacts');
+  validateStagedArtifacts(resolve('release-artifacts'), validateVersions(), ctx.commit, platform === 'all' ? ['macos', 'macos-intel', 'windows'] : [platform]);
   console.log(`Verified ${requested.join(', ')}`);
+  if (platform === 'all' && process.env.GITHUB_STEP_SUMMARY) {
+    try {
+      const rows = releaseJobTimings(currentJobs);
+      const seconds = milliseconds => (milliseconds/1000).toFixed(1);
+      appendFileSync(process.env.GITHUB_STEP_SUMMARY, [
+        '## Desktop release timings', '',
+        `- Checkpoint wait and verification: ${seconds(checkpointsReadyAt-waitStartedAt)} s`,
+        `- Artifact download and validation: ${seconds(Date.now()-checkpointsReadyAt)} s`, '',
+        '| Job | Attempt | Queue (s) | Execution (s) |', '| --- | ---: | ---: | ---: |',
+        ...rows, '',
+      ].join('\n'));
+    } catch (error) {
+      console.log(`Release telemetry unavailable: ${error.message}`);
+    }
+  }
 }
 
 export function downloadArtifacts(artifacts, destination) {
@@ -318,7 +365,7 @@ export function downloadArtifacts(artifacts, destination) {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   const [command, argument] = process.argv.slice(2);
-  assert.ok(['reuse', 'probe', 'wait'].includes(command), 'Use reuse|probe COMPONENT or wait macos|all');
+  assert.ok(['reuse', 'probe', 'wait'].includes(command), 'Use reuse|probe COMPONENT or wait macos|macos-intel|all');
   if (command === 'reuse') await reuseComponent(argument);
   else if (command === 'probe') await probeComponent(argument);
   else await waitForRelease(argument);

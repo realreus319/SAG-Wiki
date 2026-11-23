@@ -5,12 +5,19 @@ import {chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, w
 import {dirname, join, resolve} from 'node:path';
 import {tmpdir} from 'node:os';
 import test from 'node:test';
-import {changedPaths, compareVersions, createPreparedCommit, validateReleaseDocumentation, releaseNotes, validatePullRequestNotes, gitAt, hasProductChanges, isProductPath, latestPublished,
-  shouldSkipRelease, nextVersion, releaseVersion, hasNewerPreparedSource, preparedContents, releaseForTag, retryAction, updateVersionFiles, validateReleaseSource, validateReplaceableDraft, validatePublicationAssets, versionFiles} from './automatic-release.mjs';
+import {changedPaths, compareVersions, createPreparedCommit, validateReleaseDocumentation, releaseNotes, releaseBody, validatePullRequestNotes, gitAt, hasProductChanges, isProductPath, latestPublished,
+  shouldSkipRelease, nextVersion, releaseVersion, hasNewerPreparedSource, preparedContents, publishDraftById, releaseForTag, retryAction, updateVersionFiles, validateReleaseSource, validateReplaceableDraft, validatePublicationAssets, versionFiles} from './automatic-release.mjs';
 import {assertNoPendingReleaseDeployments, releaseApiPath} from './migrate-release-environment.mjs';
 import {validateVersions} from './release.mjs';
 
 const root = resolve(import.meta.dirname, '..');
+test('every release body exposes Windows and both Mac installers without changing updater notes', () => {
+  const notes = '## 0.3.10\n\n- 中文\n\n### English\n\n- English\n';
+  const body = releaseBody('0.3.10', notes);
+  assert.ok(body.startsWith(notes));
+  for (const name of ['macOS-arm64.dmg','macOS-x86_64.dmg','Windows-x64-setup.exe']) assert.ok(body.includes(`https://github.com/Zleap-AI/SAG-Wiki/releases/download/v0.3.10/SAG-Wiki-0.3.10-${name}`));
+  assert.throws(()=>releaseBody('../unsafe',notes));
+});
 function fixture(documentationPath = 'docs/zh-CN/中文 更新 说明.md') {
   const directory = mkdtempSync(join(tmpdir(), 'sag-automatic-release-'));
   for (const name of [...versionFiles, 'CHANGELOG.md']) {
@@ -183,7 +190,7 @@ test('classifies docs/CI-only pushes independently of cumulative unreleased prod
     'CHANGELOG.md', 'AGENTS.md', 'scripts/automatic-release.mjs', 'scripts/automatic-release.node-test.mjs', 'scripts/release.mjs',
     'scripts/release-build-cache.node-test.mjs', 'scripts/test-profile-ab.mjs', 'scripts/test-profile-ab.node-test.mjs',
     'scripts/parallel-cli.mjs', 'scripts/parallel-cli.node-test.mjs', 'scripts/rust-dependency-cache.mjs',
-    'scripts/rust-dependency-cache.node-test.mjs', 'scripts/rust-dependency-archive.py', 'scripts/configure-release.mjs', 'scripts/migrate-release-environment.mjs']) assert.equal(isProductPath(path), false, path);
+    'scripts/rust-dependency-cache.node-test.mjs', 'scripts/rust-dependency-archive.py', 'scripts/run-pr-e2e.py', 'tests/local-jev-e2e.py', 'scripts/pr-test-plan.mjs', 'scripts/pr-test-plan.node-test.mjs', 'scripts/configure-release.mjs', 'scripts/migrate-release-environment.mjs']) assert.equal(isProductPath(path), false, path);
   for (const path of ['src/App.svelte', 'core/src/lib.rs', 'package-lock.json', 'src-tauri/tauri.conf.json',
     'scripts/build-cli.mjs', 'scripts/sign-macos-release.mjs', 'scripts/package-updates.mjs', 'unknown/new-file']) assert.equal(isProductPath(path), true, path);
   const f = fixture();
@@ -398,7 +405,8 @@ test('publication finds a draft through its listed release ID when tag lookup is
 test('publication verifies every uploaded asset against the exact successful assembly job checksum output', () => {
   const version = '0.2.14';
   const names = [`SAG-Wiki-${version}-macOS-arm64.dmg`, `SAG-Wiki-${version}-macOS-arm64.app.tar.gz`,
-    `SAG-Wiki-${version}-macOS-arm64.app.tar.gz.sig`, `SAG-Wiki-${version}-Windows-x64-setup.exe`,
+    `SAG-Wiki-${version}-macOS-arm64.app.tar.gz.sig`,
+    `SAG-Wiki-${version}-macOS-x86_64.dmg`, `SAG-Wiki-${version}-macOS-x86_64.app.tar.gz`, `SAG-Wiki-${version}-macOS-x86_64.app.tar.gz.sig`, `SAG-Wiki-${version}-Windows-x64-setup.exe`,
     `SAG-Wiki-${version}-Windows-x64-setup.exe.sig`, 'latest-v2.json', 'latest.json', 'build-metadata.json', 'release-notes.md'];
   const hash = 'a'.repeat(64);
   const checksums = names.map(name => `${hash}  ${name}`).join('\n') + '\n';
@@ -412,6 +420,55 @@ test('publication verifies every uploaded asset against the exact successful ass
   assert.throws(() => validatePublicationAssets(corrupted, checksums, digest, version), /checksum mismatch/);
   const incomplete = structuredClone(release); incomplete.assets[0].state = 'new';
   assert.throws(() => validatePublicationAssets(incomplete, checksums, digest, version), /incomplete/);
+});
+
+test('publishing uses numeric asset and release IDs and reconciles an uncertain write', async () => {
+  const release = {id: 42, assets: [{id: 730, name: 'v0.3.13-SHA256SUMS.txt'}]};
+  const calls = [];
+  let reads = 0;
+  const download = id => {
+    calls.push(['download', id]);
+    if (++reads === 1) throw new Error('HTTP 404');
+    return 'verified bytes';
+  };
+  const validate = bytes => assert.equal(bytes, 'verified bytes');
+  const update = (id, latest) => {
+    calls.push(['update', id, latest]);
+    throw new Error('spawnSync gh ETIMEDOUT');
+  };
+  const read = id => { calls.push(['read', id]); return {draft: false, id}; };
+  await publishDraftById(release, 'v0.3.13', validate, () => [{tag_name: 'v0.3.14', draft: false, prerelease: false}], {download, update, read, pause:async()=>{}});
+  assert.deepEqual(calls, [['download',730],['download',730],['update',42,false],['read',42]]);
+  let writes = 0;
+  await assert.rejects(publishDraftById(release,'v0.3.13',validate,()=>[],{
+    download: () => 'verified bytes', update: () => { writes++; throw new Error('spawnSync gh ETIMEDOUT'); },
+    read: () => { throw new Error('HTTP 503'); }, pause:async()=>{},
+  }), /503/);
+  assert.equal(writes,1,'a failed state check must not result in another PATCH');
+  await assert.rejects(publishDraftById(release,'v0.3.13',()=>{throw new Error('bad SHA256');}, ()=>[], {
+    download: () => 'different bytes', update: () => assert.fail('cannot publish unverified assets'), read,
+  }), /bad SHA256/);
+  await assert.rejects(publishDraftById({...release,assets:[...release.assets,...release.assets]},'v0.3.13',validate,()=>[],
+    {download, update, read}), /unique checksum/);
+});
+
+test('does not rewrite a published release when the by-ID read still reports draft', async () => {
+  const tag = 'v0.3.13';
+  const release = {id: 42, draft: true, tag_name: tag, assets: [{id: 730, name: `${tag}-SHA256SUMS.txt`}]};
+  let lists = 0;
+  const writes = [];
+  await publishDraftById(release, tag, bytes => assert.equal(bytes, 'verified bytes'),
+    () => ++lists === 1 ? [] : [{...release, draft: false, prerelease: false}], {
+      download: () => 'verified bytes',
+      update: (id, makeLatest) => {
+        writes.push([id, makeLatest]);
+        throw new Error('spawnSync gh ETIMEDOUT');
+      },
+      read: () => release,
+      pause: async () => {},
+    });
+  assert.equal(lists, 2);
+  assert.deepEqual(writes, [[42, true]]);
 });
 
 test('stable latest selection never rolls back or uses drafts and prereleases', () => {

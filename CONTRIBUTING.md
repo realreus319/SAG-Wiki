@@ -10,7 +10,7 @@ Before merging a product PR, append user-facing Chinese bullets and matching Eng
 
 Each functional change may end with related Issue and PR Markdown links, for example `Fix formula rendering. ([PR #142](https://github.com/Zleap-AI/SAG-Wiki/pull/142))`. Both languages retain these links. Links must accompany a functional description; link-only entries, commit subjects, commit hashes and commit links are not allowed.
 
-Fetch remote version tags before writing notes and use the next version computed by automation as the heading. Resolve version conflicts before merging. Preparation uses the reviewed notes for that version and aligns application, CLI and lockfile versions in a detached release commit without rewriting changelog headings on main. Missing or invalid notes stop preparation before tagging. Release descriptions and updater notes contain only bilingual product changes, without commit subjects, commit references, generated boilerplate or signing-migration prose. Historical prepared tags remain verifiable.
+Fetch remote version tags before writing notes and use the next version computed by automation as the heading. Resolve version conflicts before merging. Preparation uses the reviewed notes for that version and aligns application, CLI and lockfile versions in a detached release commit without rewriting changelog headings on main. Missing or invalid notes stop preparation before tagging. Updater notes contain only bilingual product changes, without commit subjects, commit references, generated boilerplate or signing-migration prose. GitHub Release descriptions append a download table for Windows x64, Apple Silicon and Intel; the updater notes asset remains product-only. Historical prepared tags remain verifiable.
 
 Desktop release tags use `vX.Y.Z`. The signing Environment remains `release`. Desktop auto-update depends on the repository's Latest desktop release and `latest-v2.json`; keep release assets and update metadata consistent.
 
@@ -18,9 +18,27 @@ Every pull request must pass the desktop checks. Force pushes and deletion of `m
 
 ## Desktop PR checks
 
-Pull requests to `main` require `E2E macos` and `E2E windows`. These run the real CLI/service indexing and retrieval flow against a local Jev protocol fixture. They compile only the CLI test executable, not the desktop application or installers; they do not exercise the desktop GUI or real model inference.
+Pull requests to `main` require `E2E macos` and `E2E windows`. The test plan
+compares the base commit with the merge candidate, counting both sides of a
+rename. Documentation-only changes complete these checks on Linux without
+compiling the CLI. Frontend changes run the frontend suite and browser fixture. The Linux test
+plan job builds the browser workspace once for both native E2E jobs.
+Changes to Rust core, client, CLI or protocol run the relevant service and CLI
+fixtures. Shared build inputs and unfamiliar paths select all suites. A failed
+plan fails both required checks.
 
-Desktop builds, unit/component tests, documentation builds, installer smoke tests and release validation remain in `Desktop build and release`, triggered after pushes to `main` or by manual dispatch. Keep the required status check names in branch protection aligned with `pr-e2e.yml`.
+The Jev, HTTP API and browser fixtures each have a separate temporary data
+directory and select ephemeral ports. At most two run together per platform.
+The PR Jev fixture covers the base endpoint and a representative full endpoint.
+Packaged release checks retain the complete endpoint matrix. CLI and client
+tests keep their existing outer fixture limit. These checks use
+local model fixtures and compile the CLI, without building installers or
+exercising the desktop GUI or real model inference.
+
+Desktop builds, the complete native test suite, installation smoke tests and
+release validation run in `Desktop build and release`. Native result reuse
+checks the embedded prompts and fixtures alongside Rust inputs. Top-level
+frontend test files are covered by the frontend suite.
 
 ## CI resource use
 
@@ -33,11 +51,33 @@ This prevents `STATUS_ENTRYPOINT_NOT_FOUND` for `comctl32!TaskDialogIndirect`
 without modifying application binaries or skipping tests. It requires the
 Windows SDK manifest tool (`mt.exe`). macOS uses the regular `cargo test` command.
 
-Frontend unit tests run once on Linux in the main desktop workflow. Both native
-platforms retain Rust tests, installer builds and real packaged/installed CLI
-checks. macOS signing starts after its verified installer build, while Rust tests and
-Windows work continue. Publication still requires the exact commit whose
-frontend, documentation and both platforms' tests and builds succeeded.
+Frontend assets are built once and frontend unit tests run once on Linux. All
+three platforms retain production builds and packaged/installed CLI checks.
+Native Rust tests are selected per Cargo package: protocol, client, core, CLI,
+and desktop. Reuse requires matching suite inputs, including dependent Rust
+packages, fixtures, dependencies, compiler configuration and platform mappings,
+and proof that the suite ran successfully on all three platforms for a published
+ancestor. A skipped suite in a newer release does not count as fresh evidence.
+If no matching verified execution is found, run that suite on all three platforms.
+Only desktop build and test jobs install the JavaScript workspace. Production
+CLI compilation uses the portable web artifact from the current release run.
+The Intel CLI compiler runs on Apple Silicon with an explicit x86_64 target.
+It verifies Rosetta and checks the CLI and QPDF architectures before uploading
+the input. Intel desktop packaging, installer validation and signing still run
+on Intel runners. The compiler host forms part of the dependency cache key. Only automatic CLI/desktop version tokens
+are ignored. This includes the model-capability and SAG-tool JSON embedded by Rust;
+add any new external compile-time inputs to the selector and its regression tests.
+Changed or unverifiable inputs run the affected suites on native runners. Reused
+results are recorded by lightweight Ubuntu jobs without allocating Macs. Python
+and Safari native checks run in the corresponding production build. No required
+check or approval is added. Each Mac signer starts after its own build; final
+publication still requires all three platforms, frontend, documentation and artifact
+checks from the exact release commit. Mac staging contains only the App archive;
+the protected signer creates and verifies the final DMG. Legacy two-file Mac
+checkpoints remain reusable. Complete Jev E2E runs once on identical signed Mac
+binaries, with content, identity, signature and ticket checks retained for both
+updater archives and mounted DMGs. Each stable Release must include Windows x64
+and both Mac installers; existing assembly and publication requirements remain.
 
 CI sets `CARGO_TARGET_DIR` to `src-tauri/target` in each worker. CLI and desktop
 production compilation run on independent workers for each platform, then join
@@ -67,8 +107,9 @@ only `validation-rust-deps-*` artifacts, which trusted consumers reject. Export
 and upload are bounded, optional steps; include their overhead in CI timings.
 
 Tested main installers remain available for 14 days so a release can reuse them;
-Safari development installers and signed intermediate artifacts are retained for
-3 days. Public Release assets are unchanged.
+Signed intermediate artifacts are retained for 3 days. Safari development
+installers are built separately when needed, not as part of desktop releases.
+Public Release asset names and platform requirements are unchanged.
 
 Dependency archives use the runner's existing zstd with multithreaded compression and streaming tar I/O. Restore validates the complete staged content and decompressor result before atomically replacing dependency files. Cache failure remains a normal-compilation fallback.
 
@@ -94,12 +135,36 @@ codegen candidates. Use three paired rounds before adopting a setting; a lower
 single-run time is insufficient evidence. Benchmark artifacts never substitute
 for native release checks.
 
-The measured candidates have not established a material, stable net reduction
-in core compilation plus execution. Desktop native tests therefore retain
-`CARGO_PROFILE_TEST_DEBUG=1` and the existing nonincremental CGU16 baseline;
-release LTO, codegen units and optimization settings remain unchanged. Evaluate
-both compile and test execution costs rather than selecting by compiler time
-alone.
+Use `platform=macos-intel` and `comparison=core-debug-only` to compare the
+desktop baseline with debug metadata disabled only for `sag-core` on an Intel
+runner. Both profiles configure the same third-party dependencies and run the
+same named tests. Check paired build-plus-test time and retain the Cargo timing
+reports to identify the compilation unit responsible for any difference.
+
+Three paired Intel runs supported disabling debug information for `sag-core`
+in the Intel Core and CLI test suites. Both suites pass the same Cargo package
+override so the CLI suite can reuse the core library. Other crates and platforms
+retain debug level 1 and the nonincremental CGU16 baseline. The Intel change
+reduces source detail in core test backtraces. It applies only to the test
+profile and keeps assertions and overflow checks enabled. Production release
+LTO, codegen units and optimization settings remain unchanged.
+
+Run `Rust test profile A/B` on a branch with `platform=macos-intel` and
+`comparison=intel-core-cgu` to compare the current package-scoped debug=0
+baseline with `sag-core` CGU32 and CGU64. The experiment rotates the profiles
+over three paired rounds, runs the same named Core tests and then the two
+release CLI test commands. Compare the paired Core-plus-CLI wall times from
+`scripts/test-profile-ab.mjs summarize`. In [run 44503310286](https://github.com/Zleap-AI/SAG-Wiki/actions/runs/44503310286),
+CGU32 improved all three paired Core-plus-CLI times by 80, 93, and 251 seconds.
+CGU64 regressed one round by 176 seconds. Intel Core and CLI now use CGU32
+only for `sag-core` in the test profile. The baseline remains CGU16 for future
+comparisons. Benchmark runs create neither releases nor trusted checkpoints.
+
+The draft release job reports per-job GitHub queue and execution time, and
+reports checkpoint waiting separately from artifact download and validation.
+Publication uses the verified checksum asset ID and the exact draft release ID.
+A transient failure may be retried within the same publication lock after checking
+the draft state. Source, checksum, signing and platform checks still gate publication.
 
 For an internal/build-only PR that does not need its own release, maintainers may add `release:skip` before merging. PR checks remain required. Automatic preparation checks merged PR associations for every product commit in the captured main push (merge, squash or rebase); all must have this label to skip tag creation and publication. Mixed pushes containing an ordinary feature PR still release. API errors stop preparation without creating a tag. This is a per-push decision: a later feature release includes the accumulated changes. Labels are read when the workflow runs; adding one after preparation has started does not cancel an existing release.
 

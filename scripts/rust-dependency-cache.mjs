@@ -5,6 +5,7 @@ import {tmpdir} from 'node:os';
 import {resolve, join} from 'node:path';
 import {spawnSync} from 'node:child_process';
 import {pathToFileURL} from 'node:url';
+import {targets} from './release.mjs';
 import {gitAt, validateReleaseSource} from './automatic-release.mjs';
 import {validateRun, componentState, selectArchive, downloadArtifacts, hashFile,latestJob} from './release-build-cache.mjs';
 
@@ -66,9 +67,9 @@ function context() {
   assert.equal(process.env.GITHUB_REPOSITORY, repository);
   const kind = process.env.CACHE_KIND;
   const platform = process.env.RELEASE_PLATFORM;
-  assert.ok(['test', 'build'].includes(kind) && ['macos', 'windows'].includes(platform));
+  assert.ok(['test', 'build'].includes(kind) && Object.hasOwn(targets, platform));
   const target = process.env.TARGET_TRIPLE;
-  assert.equal(target, platform === 'macos' ? 'aarch64-apple-darwin' : 'x86_64-pc-windows-msvc');
+  assert.equal(target, targets[platform]);
   const commit = process.env.GITHUB_SHA;
   assert.match(commit ?? '', /^[a-f0-9]{40}$/);
   const currentRunId = Number(process.env.GITHUB_RUN_ID);
@@ -92,11 +93,12 @@ async function restore(ctx) {
     for (const run of runs) {
       if (run.id >= ctx.currentRunId || !/^v\d+\.\d+\.\d+$/.test(run.head_branch ?? '')) continue;
       try {
+        // Reject incompatible inputs before fetching job/artifact histories.
+        if (dependencyKey(ctx.git, run.head_sha, ctx.compatibility) !== ctx.key) continue;
         const jobs = pages(`actions/runs/${run.id}/jobs?filter=all`, 'jobs');
         const job = trustedProducer(run, jobs, {...ctx, workflowId});
         // Recompute trust and compatibility from Git, not from artifact metadata.
         validateReleaseSource(ctx.git, run.head_sha, run.head_branch);
-        if (dependencyKey(ctx.git, run.head_sha, ctx.compatibility) !== ctx.key) continue;
         const artifacts = pages(`actions/runs/${run.id}/artifacts`, 'artifacts');
         const artifact = selectArchive(artifacts, run, name(ctx, job.run_attempt), job);
         const destination = join(temporary, String(run.id));

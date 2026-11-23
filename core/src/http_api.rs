@@ -31,6 +31,8 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+mod access;
+use access::KeyScope;
 mod mcp;
 mod web;
 
@@ -41,6 +43,8 @@ struct Key {
     prefix: String,
     created_at: i64,
     digest: Vec<u8>,
+    #[serde(default)]
+    scope: KeyScope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     secret: Option<String>,
     #[serde(skip)]
@@ -51,6 +55,10 @@ struct Config {
     enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     web_code: Option<String>,
+    #[serde(default)]
+    web_allow_anonymous: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    web_external_url: Option<String>,
     #[serde(skip)]
     api_cancel: CancellationToken,
     #[serde(skip)]
@@ -64,6 +72,8 @@ impl Default for Config {
         Self {
             enabled: false,
             web_code: None,
+            web_allow_anonymous: cfg!(target_os = "linux"),
+            web_external_url: None,
             api_cancel: CancellationToken::new(),
             web_cancel: CancellationToken::new(),
             host: "0.0.0.0".into(),
@@ -106,6 +116,18 @@ fn load(data: &Path) -> Result<Config> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
         Err(e) => Err(e.into()),
     }
+}
+
+pub(crate) fn copy_relocated_config(
+    source: &Path,
+    target: &Path,
+    relocate: impl Fn(&Path) -> Option<std::path::PathBuf>,
+) -> Result<()> {
+    let mut config: Config = serde_json::from_slice(&std::fs::read(source)?).context("API 配置无效")?;
+    for key in &mut config.keys {
+        key.scope.relocate(&relocate)?;
+    }
+    write_private(target, &serde_json::to_vec_pretty(&config)?)
 }
 pub fn offline_status(data: &Path) -> Result<Value> {
     let config = load(data)?;
@@ -163,7 +185,7 @@ fn status_value(
     lan.sort();
     lan.dedup();
     Ok(
-        json!({"enabled":c.enabled,"running":c.enabled&&running,"web_enabled":c.web_code.is_some(),"web_running":c.web_code.is_some()&&running,"host":c.host,"port":c.port,"local_url":format!("http://{local}:{}",c.port),"lan_urls":lan,"key_count":c.keys.len(),"autostart":autostart,"last_error":last_error}),
+        json!({"enabled":c.enabled,"running":c.enabled&&running,"web_enabled":c.web_code.is_some(),"web_running":c.web_code.is_some()&&running,"web_access_code_required":!c.web_allow_anonymous,"web_external_url":c.web_external_url,"host":c.host,"port":c.port,"local_url":format!("http://{local}:{}",c.port),"lan_urls":lan,"key_count":c.keys.len(),"autostart":autostart,"last_error":last_error}),
     )
 }
 impl ApiService {
@@ -261,14 +283,20 @@ impl ApiService {
             Ok(())
         })
     }
-    pub(crate) async fn reset(&self) -> Result<()> {
+    pub(crate) async fn reset(&self, keep_web: bool) -> Result<()> {
         let _gate = self.gate.lock().await;
-        let keys = self.config.lock().unwrap().keys.clone();
-        self.save(Config::default())?;
-        for key in keys {
+        let old = self.config.lock().unwrap().clone();
+        let config = if keep_web {
+            Config { host: old.host, port: old.port, web_code: old.web_code, web_allow_anonymous: old.web_allow_anonymous, web_external_url: old.web_external_url, web_cancel: old.web_cancel, ..Config::default() }
+        } else {
+            Config::default()
+        };
+        self.save(config)?;
+        old.api_cancel.cancel();
+        for key in old.keys {
             key.cancel.cancel();
         }
-        self.shutdown().await?;
+        if !keep_web { self.shutdown().await?; }
         if crate::api_autostart::enabled(&self.data)? {
             let data = self.data.clone();
             tokio::task::spawn_blocking(move || {
@@ -285,6 +313,31 @@ impl ApiService {
             r.task.await.context("API 停止任务失败")?;
         }
         Ok(())
+    }
+    fn web_code(&self) -> Result<String> {
+        let config = self.config.lock().unwrap();
+        anyhow::ensure!(!config.web_allow_anonymous, "网页访问码已关闭");
+        config.web_code.clone().context("请先启用网页服务")
+    }
+    // Callers hold the management lock so checking the session and changing the code are atomic.
+    fn update_web_code(&self, required: bool, rotate: bool) -> Result<Option<String>> {
+        let mut config = self.config.lock().unwrap().clone();
+        let allow_anonymous = !required;
+        if rotate {
+            anyhow::ensure!(config.web_code.is_some(), "请先启用网页服务");
+            anyhow::ensure!(!config.web_allow_anonymous, "网页访问码已关闭");
+        } else if config.web_allow_anonymous == allow_anonymous {
+            return Ok(if required { config.web_code } else { None });
+        }
+        config.web_allow_anonymous = allow_anonymous;
+        if required && config.web_code.is_some() {
+            config.web_code = Some(uuid::Uuid::new_v4().simple().to_string());
+        }
+        let code = if required { config.web_code.clone() } else { None };
+        let cancel = std::mem::take(&mut config.web_cancel);
+        self.save(config)?;
+        cancel.cancel();
+        Ok(code)
     }
     pub async fn manage(
         self: &Arc<Self>,
@@ -323,17 +376,20 @@ impl ApiService {
                 *self.last_error.lock().unwrap() = None;
                 self.status()
             }
-            ApiAction::WebCode => {
-                let c = self.config.lock().unwrap();
-                Ok(json!({"code":c.web_code.as_deref().context("请先启用网页服务")?}))
-            }
+            ApiAction::WebCode => Ok(json!({"code":self.web_code()?})),
             ApiAction::WebRotateCode => {
-                let mut c = self.config.lock().unwrap().clone();
-                anyhow::ensure!(c.web_code.is_some(), "请先启用网页服务");
-                c.web_code = Some(uuid::Uuid::new_v4().simple().to_string());
-                let cancel = std::mem::take(&mut c.web_cancel);
-                self.save(c)?;
-                cancel.cancel();
+                self.update_web_code(true, true)?;
+                self.status()
+            }
+            ApiAction::WebSetAccessCode { required } => {
+                self.update_web_code(required, false)?;
+                self.status()
+            }
+            ApiAction::WebSetExternalUrl { url } => {
+                let url = url.as_deref().map(web::external_origin).transpose()?;
+                let mut config = self.config.lock().unwrap().clone();
+                config.web_external_url = url;
+                self.save(config)?;
                 self.status()
             }
             ApiAction::Configure { host, port } => {
@@ -371,29 +427,20 @@ impl ApiService {
                 }.context("请先创建 API Key")?;
                 Ok(json!({"key":secret}))
             }
-            ApiAction::CreateKey { name } => {
-                if name.trim().is_empty() || name.chars().count() > 100 {
-                    bail!("Key 名称需为 1–100 个字符")
-                }
-                let secret = format!(
-                    "sag_{}{}",
-                    uuid::Uuid::new_v4().simple(),
-                    uuid::Uuid::new_v4().simple()
-                );
-                let key = Key {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    name: name.trim().into(),
-                    prefix: format!("{}…{}", &secret[..12], &secret[secret.len() - 4..]),
-                    created_at: store::now(),
-                    digest: Sha256::digest(secret.as_bytes()).to_vec(),
-                    secret: Some(secret.clone()),
-                    cancel: CancellationToken::new(),
-                };
-                let mut result = key_metadata(&key);
-                result["key"] = json!(secret);
+            ApiAction::CreateKey { name } => self.create_key(name, KeyScope::All),
+            ApiAction::CreateScopedKey { name, paths } => {
+                let scope = KeyScope::create(&service.store, sag_protocol::ApiScope::Folders { paths })?;
+                self.create_key(name, scope)
+            }
+            ApiAction::UpdateKeyScope { id, scope } => {
+                let scope = KeyScope::create(&service.store, scope)?;
                 let mut c = self.config.lock().unwrap().clone();
-                c.keys.push(key);
+                let key = c.keys.iter_mut().find(|key| key.id == id).context("API Key 不存在")?;
+                key.scope = scope;
+                let old = std::mem::take(&mut key.cancel);
+                let result = key_metadata(key);
                 self.save(c)?;
+                old.cancel();
                 Ok(result)
             }
             ApiAction::RevokeKey { id } => {
@@ -422,7 +469,33 @@ impl ApiService {
             }
         }
     }
-    fn authenticate(&self, request: &Request<Incoming>) -> Option<(CancellationToken, CancellationToken)> {
+    fn create_key(&self, name: String, scope: KeyScope) -> Result<Value> {
+        if name.trim().is_empty() || name.chars().count() > 100 {
+            bail!("Key 名称需为 1–100 个字符")
+        }
+        let secret = format!(
+            "sag_{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        let key = Key {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.trim().into(),
+            prefix: format!("{}…{}", &secret[..12], &secret[secret.len() - 4..]),
+            created_at: store::now(),
+            digest: Sha256::digest(secret.as_bytes()).to_vec(),
+            scope,
+            secret: Some(secret.clone()),
+            cancel: CancellationToken::new(),
+        };
+        let mut result = key_metadata(&key);
+        result["key"] = json!(secret);
+        let mut c = self.config.lock().unwrap().clone();
+        c.keys.push(key);
+        self.save(c)?;
+        Ok(result)
+    }
+    fn authenticate(&self, request: &Request<Incoming>) -> Option<(KeyScope, CancellationToken, CancellationToken)> {
         let header = request
             .headers()
             .get(hyper::header::AUTHORIZATION)?
@@ -439,11 +512,11 @@ impl ApiService {
             .keys
             .iter()
             .find(|k| bool::from(k.digest.ct_eq(digest.as_slice())))
-            .map(|k| (k.cancel.clone(), c.api_cancel.clone()))
+            .map(|k| (k.scope.clone(), k.cancel.clone(), c.api_cancel.clone()))
     }
 }
 fn key_metadata(k: &Key) -> Value {
-    json!({"id":k.id,"name":k.name,"prefix":k.prefix,"created_at":k.created_at,"copyable":k.secret.is_some()})
+    json!({"id":k.id,"name":k.name,"prefix":k.prefix,"created_at":k.created_at,"copyable":k.secret.is_some(),"scope":k.scope.public()})
 }
 fn validate_address(host: &str, port: u16) -> Result<()> {
     let _: IpAddr = host.parse().context("请输入有效的监听 IP 地址")?;
@@ -554,7 +627,7 @@ async fn handle_http(
         return web::handle(request, service, &api, stop, disconnected, local, &id).await;
     }
     let is_mcp = request.uri().path() == "/mcp";
-    let Some((key, api_enabled)) = api.authenticate(&request) else {
+    let Some((access, key, api_enabled)) = api.authenticate(&request) else {
         let mut response = ApiError::unauthorized().response(&id);
         if is_mcp {
             response.headers_mut().insert(hyper::header::WWW_AUTHENTICATE, hyper::header::HeaderValue::from_static("Bearer"));
@@ -569,9 +642,9 @@ async fn handle_http(
     let operation = async {
         if is_mcp {
             request.headers_mut().remove(hyper::header::AUTHORIZATION);
-            mcp::handle(request, service, cancel.clone(), started, &id, local).await
+            mcp::handle(request, service, access, cancel.clone(), started, &id, local).await
         } else {
-            dispatch(request, service, cancel.clone(), started, &id).await.map(|value| response(StatusCode::OK, value))
+            dispatch(request, service, access, cancel.clone(), started, &id).await.map(|value| response(StatusCode::OK, value))
         }
     };
     let result = tokio::select! {
@@ -609,6 +682,7 @@ fn limit() -> usize {
 async fn dispatch(
     request: Request<Incoming>,
     service: Arc<Service>,
+    access: KeyScope,
     cancel: CancellationToken,
     started: Instant,
     id: &str,
@@ -635,13 +709,9 @@ async fn dispatch(
     match path {
         "/v1/status" => {
             let c = service.api.config.lock().unwrap().clone();
-            let roots = service
-                .store
-                .roots()
-                .map_err(ApiError::internal)?
-                .into_iter()
-                .map(|r| json!({"path":r.path,"status":r.status,"indexed_files":r.count}))
-                .collect::<Vec<_>>();
+            let store = service.store.clone();
+            let roots = tokio::task::spawn_blocking(move || access.status_roots(&store))
+                .await.map_err(ApiError::internal)??;
             Ok(
                 json!({"version":sag_protocol::BUILD_VERSION,"api":{"enabled":c.enabled,"running":true},"decision_configured":service.cli.status().map_err(ApiError::internal)?.jev_configured,"roots":roots}),
             )
@@ -657,7 +727,7 @@ async fn dispatch(
                 path = Some(value.into_owned());
             }
             let store = service.store.clone();
-            tokio::task::spawn_blocking(move || folders(&store, path.as_deref()))
+            tokio::task::spawn_blocking(move || folders(&store, path.as_deref(), &access))
                 .await
                 .map_err(ApiError::internal)?
         }
@@ -700,7 +770,7 @@ async fn dispatch(
                 })?
                 .to_bytes();
             let input: SearchRequest = serde_json::from_slice(&bytes).map_err(ApiError::bad)?;
-            run_search(service, input, cancel, started, id.to_owned()).await
+            run_search(service, input, access, cancel, started, id.to_owned()).await
         }
         _ => unreachable!(),
     }
@@ -708,6 +778,7 @@ async fn dispatch(
 async fn run_search(
     service: Arc<Service>,
     input: SearchRequest,
+    access: KeyScope,
     cancel: CancellationToken,
     started: Instant,
     id: String,
@@ -724,7 +795,7 @@ async fn run_search(
         let permit = tokio::select! {_=cancel.cancelled()=>return Err(ApiError::stopped()),permit=service.requests.clone().acquire_owned()=>permit.map_err(ApiError::internal)?};
         let work = tokio::spawn(async move {
             let _permit = permit;
-            search(service, input, cancel, started, id).await
+            search(service, input, access, cancel, started, id).await
         });
         work.await.map_err(ApiError::internal)?
     };
@@ -790,7 +861,14 @@ fn scopes(store: &Store, paths: &[String]) -> std::result::Result<Vec<String>, A
         .map(|p| store::path_text(p).map_err(ApiError::internal))
         .collect()
 }
-fn folders(store: &Store, path: Option<&str>) -> std::result::Result<Value, ApiError> {
+fn folders(store: &Store, path: Option<&str>, access: &KeyScope) -> std::result::Result<Value, ApiError> {
+    let granted = access.validate(store)?;
+    if let Some(path) = path { access.resolve(store, &[path.to_owned()])?; }
+    else if let Some(paths) = granted {
+        return Ok(json!({"folders":paths.iter().map(|path| json!({
+            "name":Path::new(path).file_name().unwrap_or_default().to_string_lossy(),"path":path
+        })).collect::<Vec<_>>()}));
+    }
     let values = if let Some(path) = path {
         let path = directory(store, path)?;
         let settings = store.settings().map_err(ApiError::internal)?;
@@ -835,6 +913,7 @@ fn folders(store: &Store, path: Option<&str>) -> std::result::Result<Value, ApiE
 async fn search(
     service: Arc<Service>,
     input: SearchRequest,
+    access: KeyScope,
     cancel: CancellationToken,
     started: Instant,
     id: String,
@@ -842,10 +921,9 @@ async fn search(
     let store = service.store.clone();
     let paths = input.paths.clone();
     let exclude = input.exclude.clone();
-    let files_only = !exclude.is_empty();
-    let scope = tokio::task::spawn_blocking(move || {
-        let scopes = scopes(&store, &paths)?;
-        store.search_scopes_excluding_each(&scopes, &exclude).map_err(ApiError::bad)
+    let selection = access.clone();
+    let (scope, files_only) = tokio::task::spawn_blocking(move || {
+        selection.search_scope(&store, &paths, &exclude)
     })
         .await
         .map_err(ApiError::internal)??;
@@ -913,6 +991,7 @@ async fn search(
     let store = service.store.clone();
     let token = cancel.clone();
     let (results,truncated)=tokio::task::spawn_blocking(move||{
+        access.validate(&store)?;
         let mut groups=indexmap::IndexMap::<(String,String),(String,Vec<(usize,usize)>)>::new();
         for candidate in candidates {
             let (_,ranges)=groups.entry((candidate.path,candidate.heading)).or_insert_with(||(candidate.hash,vec![]));
@@ -925,6 +1004,7 @@ async fn search(
             if document.hash!=hash{return Err(ApiError::internal("文件已修改，请重新搜索"))}
             let canonical=store.authorize(Path::new(&path)).map_err(ApiError::internal)?;
             let source=document.source_path.as_deref().map(|path| store.authorize(Path::new(path))).transpose().map_err(ApiError::internal)?;
+            access.check_document(&store, source.as_deref().unwrap_or(&canonical))?;
             if !canonical_scope.iter().any(|s|if files_only {canonical==*s}else{canonical.starts_with(s)||source.as_ref().is_some_and(|path| path.starts_with(s))}){return Err(ApiError::internal("结果超出搜索范围"))}
             ranges.sort_unstable();let mut merged:Vec<(usize,usize)>=vec![];
             for (start,end) in ranges{if let Some(last)=merged.last_mut().filter(|last|start<=last.1){last.1=last.1.max(end)}else{merged.push((start,end))}}

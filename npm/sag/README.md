@@ -27,11 +27,26 @@ Semantic search remains the default. Use `-E` / `--extended-regexp` for Rust reg
 
 Local matching also supports `-i`, `-w`, `-x`, `-v`, context via `-A/-B/-C`, file names via `-l`, per-file `--count`, fragments via `-o`, and silent predicates via `-q` (exit 0/1/2 for match/no match/error). Use repeated `-e` patterns or `-f FILE` (`-` for stdin), plus ordered `--include` / `--exclude` filename globs. These controls require `-E` or `-F`. `-c` still means content. `--count` scans all lines unless an explicit global `-m` limit is supplied.
 
+## File sharing
+
+Share Markdown files and referenced local images without starting the desktop app or configuring a model:
+
+```sh
+sag share ./notes
+sag download SAG-ABCDEFGH --output ./received
+sag share-history --json
+sag cancel-share SAG-ABCDEFGH
+```
+
+Shares expire after one hour. Share history lists shares created on this device; cancellation removes the server file and local record while leaving previously downloaded copies unchanged.
+
 ## HTTP API
 
 Run `sag api key create --name "Application A"`, then `sag api start` to serve local and LAN applications. The API starts separately from CLI access and does not require the desktop app. It keeps running after the terminal closes. `sag api stop` closes HTTP access while retaining the shared backend and index.
 
-Use `sag api status --json` to inspect state without starting the backend. Manage keys with `sag api key list` and `sag api key revoke KEY_ID`. Keys are shown in full only once. With no valid key, the running API returns 401 Unauthorized.
+Use `sag api status --json` to inspect state without starting the backend. Manage keys with `sag api key list` and `sag api key revoke KEY_ID`. With no valid key, the running API returns 401 Unauthorized.
+
+For project access, use `sag api key create --name "Project A" --path "/data/project-a"`. Repeat `--path` for multiple folders; omitting it grants all folders. Change the scope with `sag api key set-scope KEY_ID --path "/data/project-a"` and export the matching client configuration with `sag api mcp config --key-id KEY_ID`. The exported configuration contains the full key; keep it private.
 
 The HTTP API supports fast and deep search, source-passage results, hierarchical folder browsing and multiple absolute directory paths. Deep search uses the decision model configured by `sag config`; fast search needs no model. Optional startup registration is managed with `sag api autostart enable`, `disable` and `status`, and is off by default.
 

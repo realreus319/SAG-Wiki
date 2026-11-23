@@ -110,6 +110,10 @@ enum CliCommand {
     Download { code: String, #[arg(short, long)] output: Option<PathBuf> },
     /// 分享 Markdown 文件或文件夹。
     Share { path: PathBuf },
+    /// 查看本机尚未过期的分享记录。
+    ShareHistory { #[arg(long)] json: bool },
+    /// 取消本机创建的分享并删除服务器文件。
+    CancelShare { code: String },
     /// 管理 HTTP API 服务、Key 和自动启动。
     Api { #[command(subcommand)] action: api::ApiCommand },
     Install {
@@ -171,7 +175,10 @@ enum CliCommand {
     },
 }
 #[derive(Subcommand)]
-enum ServiceCommand { Status, Stop, Restart, #[command(hide=true)] Serve { #[arg(long)] data_dir: Option<PathBuf> } }
+enum ServiceCommand { Status, Stop, Restart,
+    #[command(hide=true)] Migrate { #[arg(long)] source: PathBuf, #[arg(long)] destination: PathBuf },
+    #[command(hide=true)] Recover { #[arg(long)] directory: PathBuf },
+    #[command(hide=true)] Serve { #[arg(long)] data_dir: Option<PathBuf> } }
 
 #[derive(Subcommand)]
 enum DoclingCommand {
@@ -191,6 +198,13 @@ fn run_docling_install(data_dir_opt: &Option<PathBuf>, profile: &str) -> Result<
         Some(data) => data.clone(),
         None => data_dir()?,
     };
+    // Downloads follow the proxy configured for this data directory, the
+    // same rule the desktop app uses for model and component downloads.
+    let proxy = sag_core::store::Store::open(&data.join("sag.sqlite"))
+        .ok()
+        .and_then(|store| store.settings().ok())
+        .map(|settings| settings.model_proxy)
+        .unwrap_or_default();
     let profiles = match profile {
         "documents" => vec![sag_protocol::DoclingProfile::Documents],
         "media" => vec![sag_protocol::DoclingProfile::Media],
@@ -204,7 +218,7 @@ fn run_docling_install(data_dir_opt: &Option<PathBuf>, profile: &str) -> Result<
         println!("Docling 组件已安装，无需重复安装。");
         return Ok(());
     }
-    docling.start_profiles(profiles)?;
+    docling.start_profiles(profiles, proxy)?;
     let mut last_line = String::new();
     loop {
         let status = docling.status();
@@ -335,6 +349,30 @@ fn main() {
     }
     let matches = Args::command().get_matches();
     let mut args = Args::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+    if let Some(CliCommand::ShareHistory { json }) = &args.command {
+        let result = (|| -> Result<()> {
+            let records = sag_client::share::history()?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&records)?);
+            } else if records.is_empty() {
+                println!("暂无分享记录");
+            } else {
+                for record in records {
+                    println!("SAG-{}\t{}\t有效期至 {}", record.code, record.name, record.expires_at);
+                }
+            }
+            Ok(())
+        })();
+        if let Err(e)=result { eprintln!("{e:#}"); std::process::exit(1); } return;
+    }
+    if let Some(CliCommand::CancelShare { code }) = &args.command {
+        let result = (|| -> Result<()> {
+            let code = sag_client::share::normalize_code(code)?;
+            tokio::runtime::Runtime::new()?.block_on(sag_client::share::cancel_share(&code))?;
+            println!("分享已取消：SAG-{code}"); Ok(())
+        })();
+        if let Err(e)=result { eprintln!("{e:#}"); std::process::exit(1); } return;
+    }
     if let Some(CliCommand::Download { code, output }) = &args.command {
         let result = (|| -> Result<()> {
             let directory = match output { Some(path) => path.clone(), None => PathBuf::from(sag_client::share::settings()?.directory) };
@@ -515,7 +553,7 @@ fn run(args: Args, interrupted: Arc<Interrupt>) -> Result<i32> {
         Some(patterns)
     } else { None };
     let (command, path, json, timeout) = match args.command {
-        Some(CliCommand::Install { .. } | CliCommand::Uninstall { .. } | CliCommand::Service{..} | CliCommand::Api{..} | CliCommand::ParseServer{..} | CliCommand::Docling{..} | CliCommand::Download{..} | CliCommand::Share{..}) => unreachable!(),
+        Some(CliCommand::Install { .. } | CliCommand::Uninstall { .. } | CliCommand::Service{..} | CliCommand::Api{..} | CliCommand::ParseServer{..} | CliCommand::Docling{..} | CliCommand::Download{..} | CliCommand::Share{..} | CliCommand::ShareHistory{..} | CliCommand::CancelShare{..}) => unreachable!(),
         Some(CliCommand::Status) => (Command::Status, cwd.clone(), false, 10),
         Some(CliCommand::List { json }) => (Command::List, cwd.clone(), json, 10),
         Some(CliCommand::Check { directory, json }) => (
@@ -756,8 +794,24 @@ fn request(command: Command, path: PathBuf, timeout: u64, interrupted: Arc<Inter
     result
 }
 fn run_service(action:&ServiceCommand)->Result<()> {
+    if let ServiceCommand::Migrate { source, destination } = action {
+        return sag_core::data_directory::migrate(source, destination, &sag_protocol::data_directory_config()?);
+    }
+    if let ServiceCommand::Recover { directory } = action {
+        return sag_core::data_directory::recover(directory, &sag_protocol::data_directory_config()?);
+    }
     let runtime=tokio::runtime::Runtime::new()?;
-    let data=match action { ServiceCommand::Serve{data_dir:Some(data)}=>data.clone(),_=>data_dir()? };
+    let data=match action {
+        ServiceCommand::Serve{data_dir:Some(data)}=>{
+            if !data.join("sag.sqlite").is_file()
+                && sag_protocol::read_data_directory_location(&sag_protocol::data_directory_config()?)?.as_deref() == Some(data.as_path())
+            {
+                bail!("应用数据目录不可用：{}", data.display());
+            }
+            data.clone()
+        }
+        _=>data_dir()?
+    };
     if matches!(action,ServiceCommand::Serve{..}) {
         let stop=tokio_util::sync::CancellationToken::new();
         let signal=stop.clone();

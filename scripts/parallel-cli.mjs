@@ -13,9 +13,13 @@ const api=path=>JSON.parse(execute('gh',['api',`repos/${repository}/${path}`]));
 const pages=(path,field)=>JSON.parse(execute('gh',['api','--paginate','--slurp',`repos/${repository}/${path}${path.includes('?')?'&':'?'}per_page=100`])).flatMap(page=>page[field]);
 const files=(directory,prefix='')=>readdirSync(join(directory,prefix),{withFileTypes:true}).flatMap(entry=>{const name=prefix?`${prefix}/${entry.name}`:entry.name;assert.ok(!entry.isSymbolicLink(),'CLI payload cannot contain symlinks');assert.ok(entry.isDirectory()||entry.isFile(),'CLI payload contains a special file');return entry.isDirectory()?files(directory,name):[name];}).sort();
 const allowed=(name,platform)=>!name.includes('\\')&&!name.includes(':')&&!name.split('/').some(part=>['','.','..'].includes(part))&&(
- name===`source/${platform==='windows'?'sag.exe':'sag'}`||name===`resources/bin/${platform==='windows'?'sag.exe':'sag'}`||name.startsWith('resources/bin/qpdf/'));
+ name===`source/${platform==='windows'?'sag.exe':'sag'}`||name===`resources/bin/${platform==='windows'?'sag.exe':'sag'}`||name.startsWith('resources/bin/qpdf/')||name.startsWith('resources/bin/pdfium/'));
 const manifestName='manifest.json';
-export const desktopCompileConfig=()=>({build:{beforeBuildCommand:'npm run build:clipper:desktop && npm run build'}});
+export const desktopCompileConfig=({reuseWeb=false}={})=>({build:{beforeBuildCommand:reuseWeb?'npm run build:clipper:desktop':'npm run build:clipper:desktop && npm run build'}});
+export function bundleArguments(platform,target){
+ assert.equal(target,targets[platform],'Unexpected bundle target');
+ return ['bundle','--ci','--target',target,...(platform==='windows'?['--config','src-tauri/tauri.windows.conf.json']:['--bundles','app'])];
+}
 export function recoverSkippedCli(job,{build,verify,record}){
  assert.equal(compilerJobMode(job),'reuse-skipped','Only a successful skipped reuse probe may recover inline');
  build();verify();record();
@@ -35,6 +39,7 @@ export function verifyCliManifest(directory,manifest,context){
  const binary=context.platform==='windows'?'sag.exe':'sag';
  assert.ok(expected.includes(`source/${binary}`)&&expected.includes(`resources/bin/${binary}`),'Missing CLI binaries');
  assert.ok(expected.includes(`resources/bin/qpdf/bin/${context.platform==='windows'?'qpdf.exe':'qpdf'}`),'Missing QPDF executable');
+ assert.ok(expected.includes(`resources/bin/pdfium/${context.platform==='windows'?'pdfium.dll':'libpdfium.dylib'}`),'Missing PDFium library');
  if(context.platform!=='windows')for(const name of [`source/${binary}`,`resources/bin/${binary}`,'resources/bin/qpdf/bin/qpdf'])assert.ok(manifest.files[name].mode&0o111,'Missing executable mode for POSIX binary');
  assert.deepEqual(files(directory).filter(name=>name!==manifestName),expected,'Unexpected CLI payload files');
  for(const name of expected)assert.equal(hashFile(join(directory,name)),manifest.files[name].sha256,'CLI payload checksum mismatch');
@@ -89,6 +94,7 @@ function stage(ctx){
  assert.equal(run.head_sha,ctx.commit);assert.equal(run.repository?.full_name,repository);assert.equal(run.head_repository?.full_name,repository);
  const {source,resource,binary}=verifyLocalBinaries(ctx);
  const directory=resolve('release-compile',`cli-${ctx.platform}`);assert.ok(!existsSync(directory),'CLI staging must be fresh');mkdirSync(join(directory,'source'),{recursive:true});mkdirSync(join(directory,'resources/bin'),{recursive:true});copyFileSync(source,join(directory,'source',binary));copyFileSync(resource,join(directory,'resources/bin',binary));cpSync(resolve('src-tauri/bin/qpdf'),join(directory,'resources/bin/qpdf'),{recursive:true,dereference:true});
+ cpSync(resolve('src-tauri/bin/pdfium'),join(directory,'resources/bin/pdfium'),{recursive:true,dereference:true});
  const manifest=createCliManifest(directory,{...ctx,job:job.id,attempt:job.run_attempt});writeFileSync(join(directory,manifestName),JSON.stringify(manifest)+'\n');
  appendFileSync(process.env.GITHUB_OUTPUT,`directory=${directory}\nartifact=${artifactName(ctx,job.run_attempt)}\n`);
 }
@@ -116,7 +122,7 @@ async function restore(ctx){
 }
 if(process.argv[1]&&import.meta.url===pathToFileURL(resolve(process.argv[1])).href){const command=process.argv[2];assert.ok(['stage','restore','compile-desktop','bundle'].includes(command));const ctx=context();
  if(command==='stage')stage(ctx);else if(command==='restore')await restore(ctx);else{const platformConfig=ctx.platform==='windows'?['--config','src-tauri/tauri.windows.conf.json']:[];
-  const args=command==='compile-desktop'?['build','--ci','--no-bundle','--target',ctx.target,...platformConfig,'--config',JSON.stringify(desktopCompileConfig()),'--','--locked','--timings']:['bundle','--ci','--target',ctx.target,...platformConfig];
+  const args=command==='compile-desktop'?['build','--ci','--no-bundle','--target',ctx.target,...platformConfig,'--config',JSON.stringify(desktopCompileConfig({reuseWeb:process.env.SAG_RELEASE_WEB_READY==='1'})),'--','--locked','--timings']:bundleArguments(ctx.platform,ctx.target);
   const result=spawnSync(process.execPath,[resolve('node_modules/@tauri-apps/cli/tauri.js'),...args],{stdio:'inherit',env:{...process.env,...(command==='compile-desktop'?{SAG_DEFER_RELEASE_RESOURCES:'1'}:{})}});assert.equal(result.status,0,`${command} failed`);
  }
 }

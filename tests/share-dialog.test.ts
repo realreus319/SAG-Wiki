@@ -73,7 +73,7 @@ it('centers the code and tells recipients where to receive it',async()=>{
  app=mount(ShareDialog,{target:document.body,props:{path:'/Notes',onClose:vi.fn(),onReceived:vi.fn()}});
  await vi.waitFor(()=>expect(button('分享').disabled).toBe(false));button('分享').click();
  await vi.waitFor(()=>expect(document.querySelector('.share-result .share-code')?.textContent).toBe('SAG-ABCDEFGH'));
- expect(document.querySelector('.share-instructions')?.textContent).toContain('设置 → 数据导入');
+ expect(document.querySelector('.share-instructions')?.textContent).toContain('设置 → 数据源');
 });
 
 it.each([[180,'180 B'],[1024,'1.0 KB'],[1048576,'1.00 MB']])('displays %i bytes without rounding small files to zero',async(size,label)=>{
@@ -104,4 +104,39 @@ it.each(['zh-CN','en'] as const)('opens the matching share-code guide in %s',asy
  document.querySelector<HTMLButtonElement>('.share-help')!.click();
  await vi.waitFor(()=>expect(api).toHaveBeenCalledWith('open_external_link',{url:`http://sag-wiki.zleap.com/${locale==='en'?'en':'zh'}/docs/file-sharing`}));
  setLanguage('zh-CN');
+});
+
+
+it.each([
+ '分享码：SAG-YQJWWBTH 复制此分享码，打开SAG-Wiki即可下载对应文件内容',
+ '分享码：SAG-YQJWWBTH\n复制此分享码，打开SAG-Wiki即可下载对应文件内容',
+ 'Share code: SAG-YQJWWBTH Copy this share code and open SAG-Wiki to download the shared files.',
+])('extracts the code from a pasted share message: %s',async(message)=>{
+ api.mockImplementation(async(command)=>command==='receive_share'?{path:'/Documents/sag-wiki/share/Notes'}:{directory:'/Documents/sag-wiki/share',clipboard:true});
+ app=mount(ShareDialog,{target:document.body,props:{onClose:vi.fn(),onReceived:vi.fn()}});
+ await vi.waitFor(()=>expect(button('下载').disabled).toBe(true));
+ const input=document.querySelector('input')!;
+ input.value=message;input.dispatchEvent(new Event('input',{bubbles:true}));await tick();
+ expect(input.value).toBe('SAG-YQJWWBTH');
+ button('下载').click();
+ await vi.waitFor(()=>expect(api).toHaveBeenCalledWith('receive_share',{code:'SAG-YQJWWBTH',directory:'/Documents/sag-wiki/share'}));
+});
+
+it('opens share history without uploading or discarding the prepared share',async()=>{
+ api.mockImplementation(async command=>{
+  if(command==='get_share_settings')return{directory:'/Documents/sag-wiki/share',clipboard:false};
+  if(command==='prepare_share')return{id:'prepared',name:'Notes',markdown_count:1,image_count:0,size:10};
+  if(command==='get_share_history')return[];
+ });
+ app=mount(ShareDialog,{target:document.body,props:{path:'/Notes',onClose:vi.fn(),onReceived:vi.fn()}});
+ await vi.waitFor(()=>expect(button('分享记录')?.disabled).toBe(false));
+ button('分享记录').click();
+ await vi.waitFor(()=>expect(document.body.textContent).toContain('暂无分享记录'));
+ expect(api).not.toHaveBeenCalledWith('upload_share',expect.anything());
+ expect(api).not.toHaveBeenCalledWith('close_share',expect.anything());
+ const history=document.querySelector('.share-history')!;
+ const close=[...history.querySelectorAll<HTMLButtonElement>('button')].find(b=>b.textContent?.trim()==='关闭')!;
+ close.click();await tick();
+ expect(document.querySelector('.share-history')).toBeNull();
+ expect(button('分享').disabled).toBe(false);
 });

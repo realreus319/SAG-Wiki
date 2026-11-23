@@ -10,6 +10,7 @@ import '../src/components/ui/controls.css';
 import '../src/styles/search.css';
 import {setLanguage} from '../src/lib/i18n';
 import {version} from '../package.json';
+import type {ChatImportSchedule,ChatSource} from '../src/lib/types';
 const params=new URLSearchParams(location.search),en=params.get('lang')==='en';
 const text=(zh:string,eng:string)=>en?eng:zh;
 const root='/Documents/SAG Wiki/'+text('项目资料','Project notes');
@@ -39,7 +40,7 @@ const conversation={id:'release-demo',title:question,updated:now,deleted:false,m
 const partial=params.get('partial')==='1';
 const roots=[{path:root,name:text('项目资料','Project notes'),status:params.has('progressive')?'indexing':partial?'partial':'ready',count:params.has('progressive')?3:docs.length,error:partial?text('未能索引 1 个文件\n文件无法读取','Could not index one file\nUnable to read the file'):null}];
 let chatImportFolder='/Documents/sag-wiki/agent-history';
-const settings={theme:'light',language:en?'en':'zh-CN',start_page:params.get('start')||'ask',editor_size:15,search_summary_enabled:true,search_summary_sources:10,answer:{model:'demo-model',models:['demo-model'],url:'https://api.example.com/v1',has_key:true},jev:{model:'Zev-1',models:[],url:'https://api.zleap.com/v1',has_key:true,auth_mode:'bearer'},retrieval:{candidate_k:50,seed_k:10,expansion_term_limit:20,max_hops:1,top_k:10,chunk_chars:512},watch:true,show_hidden:false,excluded:[],timeout_secs:120,answer_context_tokens:65536,answer_output_tokens:2048,model_profiles:{'demo-model':{system_prompt:'',sag2_enabled:true,mcp_servers:['example']}},mcp_servers:[{id:'example',name:'Example Docs',transport:'http',url:'https://mcp.example.com',command:'',args:[],require_confirmation:true,has_credentials:false,tools:[{name:'read_document',description:'Read a documentation page'}]}]};
+const settings={theme:'light',language:en?'en':'zh-CN',start_page:params.get('start')||'ask',editor_open_mode:params.has('large-reader')?'view':'edit',editor_size:15,search_summary_enabled:true,search_summary_sources:10,answer:{model:'demo-model',models:['demo-model'],url:'https://api.example.com/v1',has_key:true},jev:{model:'Zev-1',models:[],url:'https://api.zleap.com/v1',has_key:true,auth_mode:'bearer'},retrieval:{candidate_k:50,seed_k:10,expansion_term_limit:20,max_hops:1,top_k:10,chunk_chars:512},watch:true,show_hidden:false,excluded:[],timeout_secs:120,answer_context_tokens:65536,answer_output_tokens:2048,model_profiles:{'demo-model':{system_prompt:'',sag2_enabled:true,mcp_servers:['example']}},mcp_servers:[{id:'example',name:'Example Docs',transport:'http',url:'https://mcp.example.com',command:'',args:[],require_confirmation:true,has_credentials:false,tools:[{name:'read_document',description:'Read a documentation page'}]}]};
 const history=[{id:3,path:root,name:roots[0].name,started_at:now-3600000,finished_at:now-3590000,completed:3,total:4,status:'partial',error:text('未能读取部分文件，请检查文件权限。','Some files could not be read. Check file permissions.')},{id:2,path:root,name:roots[0].name,started_at:now-86400000,finished_at:now-86390000,completed:3,total:3,status:'ready',error:null}];
 const docling={installed:false,running:false,stage:'idle',message:'',downloaded:0,total:null,packages_done:null,packages_total:null,error:null,formats:[],builtin_formats:[['Documents',['pdf','docx','xlsx','epub']]],profiles:[]};
 // Catalog from the desktop Docling status response, with neither component installed.
@@ -54,11 +55,14 @@ const callbacks=new Map<number,(value:any)=>void>(),listeners=new Map<number,{ev
 const apiDemoKey={id:'demo-key',name:text('知识库助手','Knowledge assistant'),prefix:'sag_demo…0001',created_at:now,copyable:true};
 function fixtureEvent(event:string,payload:unknown){for(const [id,listener] of listeners)if(listener.event===event)callbacks.get(listener.handler)!({event,id,payload});}
 const chatSessions=[{id:'release-chat',title:text('确认发布检查流程','Confirm the release checklist'),project:'/Projects/Atlas',updated:'2026-11-15T01:00:00Z',paths:['/Example/transcripts/release.jsonl']},{id:'search-chat',title:text('搜索结果排序调整','Search ranking adjustments'),project:'/Projects/Atlas',updated:'2026-11-14T09:30:00Z',paths:['/Example/transcripts/search.jsonl']}];
+const schedules:Partial<Record<ChatSource,ChatImportSchedule>>={};
 const handlers:Record<string,(a:any)=>any>={
  browse_folders:({path})=>({path:path??'/Documents',parent:'/',home:'/Documents',folders:[{path:'/Documents/Project notes',name:text('项目资料','Project notes')},{path:'/Documents/Research',name:text('研究资料','Research')},{path:'/Documents/Archive',name:text('归档','Archive')}]}),
  list_chat_sessions:()=>({source_root:'/Example/transcripts',sessions:chatSessions,issues:[],total:2,page:0,page_size:50,projects:['/Projects/Atlas']}),
  preview_chat_import:(a)=>({title:chatSessions[0].title,body:text('# 确认发布检查流程\n\n## User\n\n发布前需要检查哪些内容？\n\n## Assistant\n\n先完成自动测试，再核对安装、搜索和文档阅读流程。\n\n1. 验证安装和启动。\n2. 导入示例文件，检查搜索结果。\n3. 核对中英文操作说明。',' # Confirm the release checklist\n\n## User\n\nWhat should we check before release?\n\n## Assistant\n\nRun automated tests, then check installation, search and document reading.\n\n1. Verify installation and startup.\n2. Import example files and inspect search results.\n3. Check the Chinese and English instructions.')+(a.includeTools?'\n\n## Tool\n\n```\nnpm test\n```':'')}),
  get_chat_import_folder:()=>chatImportFolder,
+ get_chat_import_schedule:({source}:{source:ChatSource})=>({schedule:schedules[source]??{enabled:false,time:'09:00',source_root:null,include_tools:false},last_run_at:null,last_run:null}),
+ save_chat_import_schedule:({source,schedule}:{source:ChatSource;schedule:ChatImportSchedule})=>{schedules[source]=schedule;},
  choose_chat_import_folder:()=>chatImportFolder='/Documents/'+text('自选聊天目录','Custom Chats'),
  import_chat_sessions:(a)=>a.sessions.map((s:any)=>({path:chatImportFolder+'/'+(a.source==='claude'?'claude code':'codex')+'/'+s.title+'.md',status:'imported',error:null})),
  list_answer_models:()=>['demo-model','demo-model-fast','demo-model-reasoning'],

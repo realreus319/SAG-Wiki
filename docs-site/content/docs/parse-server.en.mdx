@@ -15,6 +15,8 @@ Conversion tries the following steps in order and falls back to the next one on 
 4. Plain text (txt, md, markdown, rst, json, xml) never enters the conversion chain: it is read in as-is (the desktop app also reads text directly, never through a conversion engine) and needs no component.
 5. Audio/video: Docling media first, then ffmpeg audio extraction + ASR; video also needs a vision model for a timeline summary, otherwise the task fails with an explicit error.
 
+Long PDFs are split by the upload limit and parsed concurrently, and a failed segment falls back to the local engines; task detail shows "segment N of M" progress. Segmentation is MinerU-first, so choosing anydoc or Docling as the PDF preferred engine skips segmentation and starts the whole file with that engine; choosing MinerU or auto keeps the segmented path.
+
 Tasks are deduplicated by file-content MD5: resubmitting the same file returns the existing task instead of parsing again. You can pass a `client_id` when submitting, so tasks and logs can be attributed to a caller. Uploads are stored on disk under their MD5 with a sharded directory tree; the original file name is kept on the task record and shown in the task list, task detail, and downloads.
 
 ## Docker deployment
@@ -68,6 +70,8 @@ sag docling install --data-dir /path/to/data  # data directory, defaults to the 
 - **Media component**: openai-whisper + the whisper-tiny model + a bundled ffmpeg; used when audio/video goes through Docling media.
 
 Components live under the data directory (`docling/` and `docling/media/`) and stay usable after one install. The prebuilt components in the base image sit at `/opt/sag/docling-documents` and `/opt/sag/docling-media`. The Docker entrypoint runs `sag docling install` before the API starts to copy them into the data directory locally; existing components are not copied again. You can also point `SAG_DOCLING_COMPONENT_DIR` / `SAG_DOCLING_MEDIA_COMPONENT_DIR` at your own prebuilt component directories (they must contain `manifest.json`, a Python runtime, site-packages, and models).
+
+Component install and startup honor the network proxy setting stored in the same data directory (configured from the desktop app or CLI; the parse server Web UI has no separate proxy setting): `sag docling install` and the parse server starting components automatically both use that proxy, and connect directly when none is set.
 
 ## Web UI
 
@@ -131,7 +135,7 @@ The parse server only supports MinerU official (mineru.net); 302.AI has been rem
 
 ## Settings
 
-- **Preferred engine per file type**: PDF, Office documents, and images each pick a preferred engine (auto / MinerU / anydoc / Docling; images have no anydoc). The chosen engine runs first and the others still fall back in their default order on failure. Audio can prefer Docling media or direct ASR; video can prefer Docling media or the timeline summary (ASR + vision model).
+- **Preferred engine per file type**: PDF, Office documents, and images each pick a preferred engine (auto / MinerU / anydoc / Docling; images have no anydoc). The chosen engine runs first and the others still fall back in their default order on failure. Choosing a local engine (anydoc or Docling) for PDF skips the MinerU segmented path so the chosen engine really runs first; MinerU or auto keeps the segmented path. Audio can prefer Docling media or direct ASR; video can prefer Docling media or the timeline summary (ASR + vision model).
 - **One configuration dialog per engine**: click "Configure" to open that engine's own settings — MinerU (switch, model, parse method, OCR/table/formula, timeouts and concurrency), anydoc (Office text-only, size caps), Docling (timeout, threads, OCR/table), ASR (engine, base URL, model, timeouts and chunking), vision model (base URL, model, key, system prompt).
 - **Queue concurrency**: 4 by default, adjustable from 1 to 16, effective for newly started tasks immediately.
 - **MinerU concurrency**: cloud concurrency, 2 by default, adjustable from 1 to 16.
