@@ -156,12 +156,31 @@ function normStatus(s) {
 }
 function normTask(t) {
   t = t || {};
+  // 详情接口沿用历史契约：时间戳是秒，progress 是 JSON 字符串；
+  // 列表接口给的是毫秒与 {current,total}。统一成毫秒 / 对象，
+  // 否则详情页会显示 1970 年、分段进度也渲染不出来。
+  const ms = v => {
+    const n = Number(v);
+    if (!Number.isFinite(n) || n <= 0) return null;
+    return n < 1e12 ? n * 1000 : n;   // 秒级时间戳换算成毫秒
+  };
+  let progress = t.progress ?? t.extract_progress ?? null;
+  if (typeof progress === 'string') {
+    try { progress = JSON.parse(progress); } catch (e) { progress = null; }
+  }
+  // 记录里的分段字段平铺在同一层；整理成列表接口的 {current,total}。
+  if (progress && typeof progress === 'object' && !('current' in progress)
+      && progress.segment_current) {
+    progress = { current: progress.segment_current, total: progress.segment_total };
+  }
   const created = t.created_at || t.submitted_at || t.createdAt || null;
   const finished = t.finished_at || t.completed_at || t.updated_at || null;
+  const createdAt = created ? ms(created) : null;
+  const finishedAt = finished ? ms(finished) : null;
   let duration = t.duration_ms ?? t.elapsed_ms ?? t.duration ?? null;
-  if (duration == null && created) {
-    const end = finished ? new Date(finished) : new Date();
-    duration = end - new Date(created);
+  if (duration == null && createdAt) {
+    const end = finishedAt || Date.now();
+    duration = end - createdAt;
     if (isNaN(duration) || duration < 0) duration = null;
   }
   return {
@@ -174,12 +193,12 @@ function normTask(t) {
     inputPath: t.input_file || t.input || '',
     output: t.output_file || t.output || '',
     clientId: t.client_id || t.clientId || '',
-    createdAt: created,
-    finishedAt: finished,
+    createdAt,
+    finishedAt,
     durationMs: duration,
     error: t.error || t.error_message || '',
     prompt: t.prompt || '',
-    progress: t.progress ?? t.extract_progress ?? null,   // 0..1 / 0..100 / {current,total}
+    progress,   // 0..1 / 0..100 / {current,total}
     remoteState: t.remote_state || '',
     attempts: t.attempts || t.engine_chain || t.engine_attempts || t.steps || null,
     raw: t,
