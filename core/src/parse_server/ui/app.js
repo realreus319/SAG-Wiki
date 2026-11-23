@@ -168,7 +168,10 @@ function normTask(t) {
     id: t.task_id || t.id || '',
     status: normStatus(t.status),
     engine: t.engine || t.current_engine || '—',
-    input: t.input_file || t.filename || t.input || '',
+    // 上传文件按 MD5 重命名存放，`input_file` 只是服务端路径；
+    // 展示与搜索用用户提交时的原始文件名（`filename`）。
+    input: t.filename || t.original_name || t.input_file || t.input || '',
+    inputPath: t.input_file || t.input || '',
     output: t.output_file || t.output || '',
     clientId: t.client_id || t.clientId || '',
     createdAt: created,
@@ -267,7 +270,7 @@ function renderTaskList(tasks) {
     const prog = progressOf(t);
     const pct = t.status === 'completed' ? 100 : (prog ? prog.pct : (t.status === 'processing' ? null : 0));
     const meta = [
-      baseName(t.input) || t.id,
+      shortId(t.id),
       '引擎 ' + t.engine,
       t.clientId ? 'client ' + t.clientId : null,
       fmtTime(t.createdAt),
@@ -502,7 +505,9 @@ function renderDetail(t) {
   $('#detail-client').textContent = t.clientId || '—';
   $('#detail-created').textContent = fmtTime(t.createdAt);
   $('#detail-duration').textContent = t.durationMs != null ? fmtDuration(t.durationMs) : '—';
-  $('#detail-input').textContent = t.input || '—';
+  $('#detail-input').textContent = t.inputPath && t.inputPath !== t.input
+    ? (t.input || t.inputPath) + '（服务端路径：' + t.inputPath + '）'
+    : (t.input || '—');
   $('#detail-output').textContent = t.output || '—';
   $('#detail-taskid').textContent = t.id;
   $('#detail-restart').disabled = !(t.status === 'failed' || t.status === 'completed');

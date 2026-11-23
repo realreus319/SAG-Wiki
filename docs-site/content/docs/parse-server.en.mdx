@@ -15,7 +15,7 @@ Conversion tries the following steps in order and falls back to the next one on 
 4. Plain text (txt, md, markdown, rst, json, xml) never enters the conversion chain: it is read in as-is (the desktop app also reads text directly, never through a conversion engine) and needs no component.
 5. Audio/video: Docling media first, then ffmpeg audio extraction + ASR; video also needs a vision model for a timeline summary, otherwise the task fails with an explicit error.
 
-Tasks are deduplicated by file-content MD5: resubmitting the same file returns the existing task instead of parsing again. You can pass a `client_id` when submitting, so tasks and logs can be attributed to a caller.
+Tasks are deduplicated by file-content MD5: resubmitting the same file returns the existing task instead of parsing again. You can pass a `client_id` when submitting, so tasks and logs can be attributed to a caller. Uploads are stored on disk under their MD5 with a sharded directory tree; the original file name is kept on the task record and shown in the task list, task detail, and downloads.
 
 ## Docker deployment
 
@@ -99,9 +99,9 @@ The default Docker base URL is `http://127.0.0.1:8005` (the container still list
 | --- | --- | --- |
 | GET | `/health` | Service status and per-status task counts |
 | POST | `/convert` | Upload `files[]` to parse, or re-run with `task_id` + `prompt`; returns a `task_id` and status per file |
-| POST | `/tasks` | Submit an already-uploaded file: `input_file` (relative path under uploads, required), `output_file`, `task_id`, `client_id` |
+| POST | `/tasks` | Submit an already-uploaded file: `input_file` (relative path under uploads, required), `filename` (optional original file name for list display), `output_file`, `task_id`, `client_id` |
 | GET | `/tasks/{id}` | Task record, including the attempt chain, progress, and elapsed time |
-| GET | `/api/tasks?status=&client_id=&search=&page=&page_size=` | Task list, newest first; filter by status and `client_id`, search by file path or `task_id`; `page_size` defaults to 20, max 100 |
+| GET | `/api/tasks?status=&client_id=&search=&page=&page_size=` | Task list, newest first; filter by status and `client_id`, search by original file name, upload path, or `task_id`; `page_size` defaults to 20, max 100 |
 | GET | `/tasks/{id}/result` | Returns inline `markdown` when completed; the status while pending/processing; HTTP 500 with the original error on failure |
 | POST | `/tasks/{id}/restart` | Only failed/completed tasks can be restarted |
 | POST | `/tasks/{id}/cancel` | Pending tasks are cancelled immediately; processing tasks get a cancel flag and finish as failed |
@@ -146,4 +146,4 @@ The parse server only supports MinerU official (mineru.net); 302.AI has been rem
 - Formats such as html, msg, and zip are not handled by anydoc and can only go through Docling; the Docker image ships with the Docling components, and without Docker a missing component makes those tasks fail with an explicit error — install it with `sag docling install`.
 - MinerU 429 switching happens at task granularity; a single task does not retry with another key.
 - Video tasks fail when no vision model is configured (the ASR stage still completes, and the error explains the cause).
-- Task-list `search` matches the upload path (which contains the MD5 sharded directory) and `task_id`; the original file name is not stored separately, so searching by it only matches the extension or an MD5 substring.
+- Task-list `search` matches the original file name, the upload path (which contains the MD5 sharded directory), and `task_id`; tasks created before this name was recorded can only be found by upload path and `task_id`.

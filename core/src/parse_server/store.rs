@@ -47,6 +47,10 @@ pub struct ParseStore {
     path: PathBuf,
 }
 
+/// Column list shared by every `parse_jobs` read, so a new column only
+/// needs to be added in one place.
+const RECORD_COLUMNS: &str = "task_id,input_md5,input_file,original_name,output_file,client_id,engine,status,prompt,attempts,error,created_at,updated_at,started_at,finished_at,pages,progress";
+
 fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<ParseJobRecord> {
     let status: String = row.get("status")?;
     let attempts_json: String = row.get("attempts")?;
@@ -54,6 +58,7 @@ fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<ParseJobRecord> {
         task_id: row.get("task_id")?,
         input_md5: row.get("input_md5")?,
         input_file: row.get("input_file")?,
+        original_name: row.get("original_name")?,
         output_file: row.get("output_file")?,
         client_id: row.get("client_id")?,
         engine: row.get("engine")?,
@@ -82,6 +87,7 @@ impl ParseStore {
                 task_id TEXT PRIMARY KEY,
                 input_md5 TEXT NOT NULL,
                 input_file TEXT NOT NULL,
+                original_name TEXT,
                 output_file TEXT NOT NULL,
                 client_id TEXT,
                 engine TEXT NOT NULL,
@@ -121,6 +127,18 @@ impl ParseStore {
             CREATE INDEX IF NOT EXISTS idx_parse_logs_task ON parse_logs(task_id);
             CREATE INDEX IF NOT EXISTS idx_parse_logs_ts ON parse_logs(ts);",
         )?;
+        // Databases created before `original_name` existed are upgraded in
+        // place; the column is nullable, so older rows simply report none.
+        let has_original_name = {
+            let mut stmt = db.prepare("PRAGMA table_info(parse_jobs)")?;
+            let names = stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            names.iter().any(|name| name == "original_name")
+        };
+        if !has_original_name {
+            db.execute("ALTER TABLE parse_jobs ADD COLUMN original_name TEXT", [])?;
+        }
         Ok(Self {
             db: Mutex::new(db),
             path: path.to_path_buf(),
@@ -130,12 +148,13 @@ impl ParseStore {
     pub fn insert(&self, record: &ParseJobRecord) -> Result<()> {
         let db = self.db.lock().unwrap();
         db.execute(
-            "INSERT INTO parse_jobs (task_id,input_md5,input_file,output_file,client_id,engine,status,prompt,attempts,error,created_at,updated_at,started_at,finished_at,pages,progress)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+            "INSERT INTO parse_jobs (task_id,input_md5,input_file,original_name,output_file,client_id,engine,status,prompt,attempts,error,created_at,updated_at,started_at,finished_at,pages,progress)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
             params![
                 record.task_id,
                 record.input_md5,
                 record.input_file,
+                record.original_name,
                 record.output_file,
                 record.client_id,
                 record.engine,
@@ -158,7 +177,7 @@ impl ParseStore {
         let db = self.db.lock().unwrap();
         Ok(db
             .query_row(
-                "SELECT task_id,input_md5,input_file,output_file,client_id,engine,status,prompt,attempts,error,created_at,updated_at,started_at,finished_at,pages,progress FROM parse_jobs WHERE task_id=?1",
+                &format!("SELECT {RECORD_COLUMNS} FROM parse_jobs WHERE task_id=?1"),
                 params![task_id],
                 row_to_record,
             )
@@ -169,17 +188,32 @@ impl ParseStore {
         let db = self.db.lock().unwrap();
         Ok(db
             .query_row(
-                "SELECT task_id,input_md5,input_file,output_file,client_id,engine,status,prompt,attempts,error,created_at,updated_at,started_at,finished_at,pages,progress FROM parse_jobs WHERE input_md5=?1 ORDER BY created_at DESC LIMIT 1",
+                &format!(
+                    "SELECT {RECORD_COLUMNS} FROM parse_jobs WHERE input_md5=?1 ORDER BY created_at DESC LIMIT 1"
+                ),
                 params![md5],
                 row_to_record,
             )
             .optional()?)
     }
 
+    /// Fill in the original file name on a record that predates the
+    /// column, or one created without a name. Never overwrites a name
+    /// that is already stored.
+    pub fn set_original_name_if_missing(&self, task_id: &str, name: &str) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        db.execute(
+            "UPDATE parse_jobs SET original_name=?1 WHERE task_id=?2 AND (original_name IS NULL OR original_name='')",
+            params![name, task_id],
+        )?;
+        Ok(())
+    }
+
     /// Paginated task list for `GET /api/tasks`, newest first.
     /// `status` must already be validated by the caller (one of
     /// pending/processing/completed/failed); `search` matches
-    /// `input_file` or `task_id` (LIKE wildcards in the term are escaped).
+    /// `original_name`, `input_file` or `task_id` (LIKE wildcards in the
+    /// term are escaped).
     /// Returns `(page_rows, total_matching_rows)`.
     pub fn list(
         &self,
@@ -205,8 +239,12 @@ impl ParseStore {
                 .replace('\\', "\\\\")
                 .replace('%', "\\%")
                 .replace('_', "\\_");
-            conditions.push("(input_file LIKE ? ESCAPE '\\' OR task_id LIKE ? ESCAPE '\\')".into());
             let pattern = format!("%{escaped}%");
+            conditions.push(
+                "(original_name LIKE ? ESCAPE '\\' OR input_file LIKE ? ESCAPE '\\' OR task_id LIKE ? ESCAPE '\\')"
+                    .into(),
+            );
+            params.push(rusqlite::types::Value::Text(pattern.clone()));
             params.push(rusqlite::types::Value::Text(pattern.clone()));
             params.push(rusqlite::types::Value::Text(pattern));
         }
@@ -224,7 +262,7 @@ impl ParseStore {
         let page_size = page_size.clamp(1, 100);
         let offset = (page - 1) * page_size;
         let sql = format!(
-            "SELECT task_id,input_md5,input_file,output_file,client_id,engine,status,prompt,attempts,error,created_at,updated_at,started_at,finished_at,pages,progress FROM parse_jobs{where_sql} ORDER BY created_at DESC, task_id DESC LIMIT ? OFFSET ?"
+            "SELECT {RECORD_COLUMNS} FROM parse_jobs{where_sql} ORDER BY created_at DESC, task_id DESC LIMIT ? OFFSET ?"
         );
         params.push(rusqlite::types::Value::Integer(page_size as i64));
         params.push(rusqlite::types::Value::Integer(offset as i64));
@@ -331,9 +369,9 @@ impl ParseStore {
 
     pub fn unfinished(&self) -> Result<Vec<ParseJobRecord>> {
         let db = self.db.lock().unwrap();
-        let mut stmt = db.prepare(
-            "SELECT task_id,input_md5,input_file,output_file,client_id,engine,status,prompt,attempts,error,created_at,updated_at,started_at,finished_at,pages,progress FROM parse_jobs WHERE status IN ('pending','processing') ORDER BY created_at ASC",
-        )?;
+        let mut stmt = db.prepare(&format!(
+            "SELECT {RECORD_COLUMNS} FROM parse_jobs WHERE status IN ('pending','processing') ORDER BY created_at ASC"
+        ))?;
         let rows = stmt
             .query_map([], row_to_record)?
             .collect::<Result<Vec<_>, _>>()?;
@@ -505,6 +543,7 @@ mod tests {
             task_id: id.into(),
             input_md5: "abc".into(),
             input_file: "ab/cd/abc.pdf".into(),
+            original_name: None,
             output_file: "temp/ab/cd/abc.md".into(),
             client_id: Some("c1".into()),
             engine: "mineru".into(),
@@ -574,28 +613,45 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = ParseStore::open(&dir.path().join("parse.db")).unwrap();
         // Newest first: created_at 300 > 200 > 100.
-        for (id, status, client, input, created) in [
+        for (id, status, client, input, original, created) in [
             (
                 "t1",
                 JobStatus::Completed,
                 Some("c1"),
                 "aa/bb/report.pdf",
+                Some("季度报告.pdf"),
                 100,
             ),
-            ("t2", JobStatus::Failed, Some("c2"), "cc/dd/notes.docx", 200),
+            (
+                "t2",
+                JobStatus::Failed,
+                Some("c2"),
+                "cc/dd/notes.docx",
+                None,
+                200,
+            ),
             (
                 "t3",
                 JobStatus::Completed,
                 Some("c1"),
                 "ee/ff/report.pdf",
+                Some("年终总结.pdf"),
                 300,
             ),
-            ("t4", JobStatus::Pending, None, "gg/hh/scan.png", 150),
+            (
+                "t4",
+                JobStatus::Pending,
+                None,
+                "gg/hh/scan.png",
+                None,
+                150,
+            ),
         ] {
             let mut rec = record(id);
             rec.status = status;
             rec.client_id = client.map(str::to_string);
             rec.input_file = input.into();
+            rec.original_name = original.map(str::to_string);
             rec.created_at = created;
             rec.updated_at = created;
             store.insert(&rec).unwrap();
@@ -621,6 +677,11 @@ mod tests {
         // A literal `%` in the search term must not act as a wildcard.
         let (rows, total) = store.list(None, None, Some("rep%rt"), 1, 20).unwrap();
         assert_eq!((total, rows.len()), (0, 0));
+        // Search also matches the original file name, not just the MD5 path.
+        let (rows, total) = store.list(None, None, Some("年终"), 1, 20).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows[0].task_id, "t3");
+        assert_eq!(rows[0].original_name.as_deref(), Some("年终总结.pdf"));
         let (rows, total) = store.list(None, None, None, 2, 3).unwrap();
         assert_eq!(total, 4);
         assert_eq!(
@@ -630,6 +691,57 @@ mod tests {
         // Unknown status / client simply match nothing.
         let (_, total) = store.list(Some("bogus"), None, None, 1, 20).unwrap();
         assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn original_name_backfills_but_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ParseStore::open(&dir.path().join("parse.db")).unwrap();
+        let mut rec = record("t1");
+        rec.original_name = None;
+        store.insert(&rec).unwrap();
+        store.set_original_name_if_missing("t1", "报告.pdf").unwrap();
+        assert_eq!(
+            store.get("t1").unwrap().unwrap().original_name.as_deref(),
+            Some("报告.pdf")
+        );
+        // A later resubmit under another name keeps the first one.
+        store.set_original_name_if_missing("t1", "别的.pdf").unwrap();
+        assert_eq!(
+            store.get("t1").unwrap().unwrap().original_name.as_deref(),
+            Some("报告.pdf")
+        );
+    }
+
+    #[test]
+    fn legacy_databases_gain_the_original_name_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parse.db");
+        {
+            // Schema as shipped before `original_name`.
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(
+                "CREATE TABLE parse_jobs (
+                    task_id TEXT PRIMARY KEY, input_md5 TEXT NOT NULL,
+                    input_file TEXT NOT NULL, output_file TEXT NOT NULL,
+                    client_id TEXT, engine TEXT NOT NULL, status TEXT NOT NULL,
+                    prompt TEXT, attempts TEXT NOT NULL DEFAULT '[]', error TEXT,
+                    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                    started_at INTEGER, finished_at INTEGER, pages INTEGER, progress TEXT
+                );
+                INSERT INTO parse_jobs VALUES ('old','m','ab/cd/o.pdf','temp/ab/cd/o.md',NULL,'mineru','completed',NULL,'[]',NULL,1,15,NULL,15,NULL,NULL);",
+            )
+            .unwrap();
+        }
+        let store = ParseStore::open(&path).unwrap();
+        let row = store.get("old").unwrap().unwrap();
+        assert_eq!(row.input_file, "ab/cd/o.pdf");
+        assert_eq!(row.original_name, None);
+        store.set_original_name_if_missing("old", "旧文件.pdf").unwrap();
+        assert_eq!(
+            store.get("old").unwrap().unwrap().original_name.as_deref(),
+            Some("旧文件.pdf")
+        );
     }
 
     #[test]

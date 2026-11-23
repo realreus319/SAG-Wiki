@@ -60,6 +60,11 @@ pub struct ParseJobRecord {
     pub input_md5: String,
     /// Path relative to the uploads root, e.g. `ab/cd/<md5>.pdf`.
     pub input_file: String,
+    /// File name as submitted by the caller, e.g. `季度报告.pdf`. The
+    /// stored upload is renamed to its MD5, so this is the only place the
+    /// original name survives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_name: Option<String>,
     /// Path relative to the outputs root, e.g. `temp/ab/cd/<md5>.md`.
     pub output_file: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -157,6 +162,22 @@ pub fn safe_relative_path(value: &str) -> Option<PathBuf> {
         return None;
     }
     Some(out)
+}
+
+/// Reduce a caller-supplied name to a display-only file name: the last
+/// path component, without control characters, capped at 200 chars.
+/// Browsers send the bare name, but `curl`-style clients may send a path.
+pub fn display_name(value: &str) -> Option<String> {
+    let name = value
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect::<String>();
+    let name = name.trim().to_string();
+    (!name.is_empty()).then_some(name)
 }
 
 /// Engine routing, mirroring mark-files-down `get_engine_for_extension`
@@ -368,6 +389,21 @@ mod tests {
             safe_relative_path("docs/./a.md"),
             Some(PathBuf::from("docs/a.md"))
         );
+    }
+
+    #[test]
+    fn display_names_keep_only_the_last_component() {
+        assert_eq!(display_name("季度报告.pdf").as_deref(), Some("季度报告.pdf"));
+        // Browsers send bare names, but a client may send a full path.
+        assert_eq!(
+            display_name("C:\\Users\\me\\报告 2024.pdf").as_deref(),
+            Some("报告 2024.pdf")
+        );
+        assert_eq!(display_name("/tmp/a/b.docx").as_deref(), Some("b.docx"));
+        // Control characters never reach the task list.
+        assert_eq!(display_name("a\u{1}b.pdf").as_deref(), Some("ab.pdf"));
+        assert_eq!(display_name("   "), None);
+        assert_eq!(display_name("dir/"), None);
     }
 
     #[test]

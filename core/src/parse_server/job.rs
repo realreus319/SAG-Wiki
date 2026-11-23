@@ -464,6 +464,7 @@ mod tests {
             task_id: task_id.into(),
             input_md5: "mock".into(),
             input_file: input_file.into(),
+            original_name: None,
             output_file: output_file.into(),
             client_id: None,
             engine: engine.into(),

@@ -27,9 +27,9 @@ use super::{
     keypool::{self, KeyPool},
     store::ParseStore,
     types::{
-        default_output_relative_path, engine_for_extension, md5_file, md5_hex, multipart_boundary,
-        now_unix, parse_multipart, resolve_task_engine, safe_relative_path, upload_relative_path,
-        JobStatus, ParseJobRecord,
+        default_output_relative_path, display_name, engine_for_extension, md5_file, md5_hex,
+        multipart_boundary, now_unix, parse_multipart, resolve_task_engine, safe_relative_path,
+        upload_relative_path, JobStatus, ParseJobRecord,
     },
 };
 use anyhow::{bail, Context, Result};
@@ -292,6 +292,7 @@ impl ParseServer {
         &self,
         md5: &str,
         input_rel: &str,
+        original_name: Option<String>,
         output_rel: Option<&str>,
         engine: &str,
         prompt: Option<String>,
@@ -299,6 +300,11 @@ impl ParseServer {
         task_id_override: Option<String>,
     ) -> Result<(String, bool)> {
         if let Some(existing) = self.jobs.get_by_md5(md5)? {
+            // Dedup returns the older task; keep its stored name untouched,
+            // but fill the gap for rows created before names were recorded.
+            if let Some(name) = original_name.as_deref() {
+                let _ = self.jobs.set_original_name_if_missing(&existing.task_id, name);
+            }
             match existing.status {
                 JobStatus::Completed => {
                     if self.outputs_dir.join(&existing.output_file).exists() {
@@ -329,6 +335,7 @@ impl ParseServer {
             task_id: task_id.clone(),
             input_md5: md5.into(),
             input_file: input_rel.into(),
+            original_name,
             output_file,
             client_id,
             engine: engine.into(),
@@ -380,7 +387,16 @@ impl ParseServer {
             std::fs::write(&dest, bytes)?;
         }
         let rel_str = rel.to_string_lossy().replace('\\', "/");
-        self.dedup_or_create(&md5, &rel_str, None, engine, prompt, client_id, None)
+        self.dedup_or_create(
+            &md5,
+            &rel_str,
+            display_name(filename),
+            None,
+            engine,
+            prompt,
+            client_id,
+            None,
+        )
     }
 
     // -- HTTP ---------------------------------------------------------------
@@ -531,6 +547,7 @@ impl ParseServer {
             task_id: task_id.into(),
             input_md5: String::new(),
             input_file: String::new(),
+            original_name: None,
             output_file: String::new(),
             client_id: None,
             engine: String::new(),
@@ -735,9 +752,17 @@ impl ParseServer {
             .get("prompt")
             .filter(|v| !v.trim().is_empty())
             .cloned();
+        // `filename` lets a client that already staged the upload under an
+        // MD5 path keep the human-readable name for the task list. Without
+        // it the record stays nameless, so a later submit can fill it in.
+        let original_name = fields
+            .get("filename")
+            .filter(|v| !v.trim().is_empty())
+            .and_then(|v| display_name(v));
         match self.dedup_or_create(
             &md5,
             &input_rel,
+            original_name,
             output_file.as_deref(),
             engine,
             prompt,
@@ -880,6 +905,7 @@ impl ParseServer {
         let (task_id, _) = self.dedup_or_create(
             &md5,
             &original.input_file,
+            original.original_name.clone(),
             None,
             &engine,
             Some(prompt.to_string()),
@@ -1595,6 +1621,9 @@ fn list_task_json(record: &ParseJobRecord) -> Value {
     json!({
         "task_id": record.task_id,
         "input_file": record.input_file,
+        // Display name as submitted; the upload itself is stored under its
+        // MD5, so the Web UI must prefer this over `input_file`.
+        "filename": record.original_name,
         "output_file": record.output_file,
         "status": record.status.as_str(),
         "engine": record.engine,
@@ -1688,6 +1717,7 @@ mod tests {
             task_id: "abc123".into(),
             input_md5: "abc123".into(),
             input_file: "ab/c1/report.pdf".into(),
+            original_name: Some("季度报告.pdf".into()),
             output_file: "temp/ab/c1/abc123.md".into(),
             client_id: Some("app-a".into()),
             engine: "mineru".into(),
@@ -1706,6 +1736,7 @@ mod tests {
         };
         let value = list_task_json(&record);
         assert_eq!(value["task_id"], "abc123");
+        assert_eq!(value["filename"], "季度报告.pdf");
         assert_eq!(value["status"], "processing");
         assert_eq!(value["client_id"], "app-a");
         // Unix seconds in the record become milliseconds for the
@@ -1719,5 +1750,49 @@ mod tests {
             ..record
         };
         assert!(list_task_json(&no_progress)["progress"].is_null());
+    }
+
+    #[test]
+    fn uploads_keep_the_original_name_and_dedup_reuses_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = ParseServer::open(dir.path().to_path_buf(), "127.0.0.1".into(), 0).unwrap();
+        let (task_id, created) = server
+            .submit_bytes("季度报告.pdf", b"%PDF-1.4 tiny", None, Some("c1".into()))
+            .unwrap();
+        assert!(created);
+        let record = server.jobs.get(&task_id).unwrap().unwrap();
+        assert_eq!(record.original_name.as_deref(), Some("季度报告.pdf"));
+        // The stored upload is the MD5 path, never the original name.
+        assert!(record.input_file.ends_with(".pdf"));
+        assert!(!record.input_file.contains("季度报告"));
+        // Same content under another name dedups to the first task and
+        // keeps the name the first caller submitted.
+        let (again, created) = server
+            .submit_bytes("另一个名字.pdf", b"%PDF-1.4 tiny", None, None)
+            .unwrap();
+        assert_eq!(again, task_id);
+        assert!(!created);
+        let record = server.jobs.get(&task_id).unwrap().unwrap();
+        assert_eq!(record.original_name.as_deref(), Some("季度报告.pdf"));
+        // A failed job is re-created; the new task carries the new name.
+        server
+            .jobs
+            .update_status(&task_id, JobStatus::Failed, Some("boom"))
+            .unwrap();
+        let (next, created) = server
+            .submit_bytes("第二个名字.pdf", b"%PDF-1.4 tiny", None, None)
+            .unwrap();
+        assert!(created);
+        assert_eq!(next, task_id);
+        assert_eq!(
+            server
+                .jobs
+                .get(&next)
+                .unwrap()
+                .unwrap()
+                .original_name
+                .as_deref(),
+            Some("第二个名字.pdf")
+        );
     }
 }
