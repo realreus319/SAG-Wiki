@@ -53,6 +53,16 @@ pub(crate) fn set_key_override(key: Option<String>) {
 pub(crate) fn clear_key_override() {
     set_key_override(None);
 }
+/// Snapshot of the calling thread's override, for work handed to a new thread.
+pub(crate) fn key_override() -> Option<String> {
+    KEY_OVERRIDE.with(|slot| slot.borrow().clone())
+}
+/// Re-installs an override inside a freshly spawned thread. Thread-locals are
+/// not inherited, so concurrent PDF segment workers would otherwise fall back
+/// to the single stored credential slot and lose the job's pool key.
+pub(crate) fn inherit_key_override(key: Option<&str>) {
+    set_key_override(key.map(str::to_owned));
+}
 pub fn key(dir: &Path, config: &MineruConfig) -> Result<String> {
     if let Some(key) = KEY_OVERRIDE.with(|slot| slot.borrow().clone()) {
         if !key.trim().is_empty() {

@@ -391,6 +391,10 @@ fn schedule_with_session<S>(
     mut release_idle: impl FnMut(&mut S) + Send,
 ) -> Result<()> {
     let abort = AtomicBool::new(false);
+    // The parse server selects a key-pool entry into a thread-local override
+    // on this thread. Spawned segment workers start with empty thread-locals,
+    // so hand every one of them the snapshot or MinerU would run keyless.
+    let key_override = crate::mineru::key_override();
     let stop = || abort.load(Ordering::Acquire) || cancel();
     let mut states: Vec<_> = doc.parts.iter().map(|_| State::Pending).collect();
     let mut failure = None;
@@ -426,7 +430,9 @@ fn schedule_with_session<S>(
         let fail = &fail;
         let ready = &ready;
         let waiters = &shared_waiters;
+        let key_override = key_override.as_deref();
         scope.spawn(move || {
+            crate::mineru::inherit_key_override(key_override);
             let mut session = create_session();
             loop {
                 let message = match local_queue.try_recv() {
@@ -484,6 +490,7 @@ fn schedule_with_session<S>(
             workers.push(work_tx);
             let (events, local, cloud) = (tx.clone(), local_tx.clone(), &cloud);
             scope.spawn(move || {
+                crate::mineru::inherit_key_override(key_override);
                 for i in work {
                     if stop() {
                         break;
