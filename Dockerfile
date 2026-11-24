@@ -44,9 +44,14 @@ WORKDIR /src
 
 # Cargo dependencies are build-only. Use the China mirror by default to avoid
 # slow or blocked direct crates.io access on mainland deployment hosts.
+# An official crates.io index needs no replacement; registering it again makes
+# cargo reject the config ("crates-io is already defined").
 RUN mkdir -p /usr/local/cargo \
-  && printf '[source.crates-io]\nreplace-with = "china-mirror"\n[source.china-mirror]\nregistry = "%s"\n' \
-    "$SAG_CARGO_REGISTRY_MIRROR" > /usr/local/cargo/config.toml
+  && case "$SAG_CARGO_REGISTRY_MIRROR" in \
+    *index.crates.io*|*crates.io-index*) : > /usr/local/cargo/config.toml ;; \
+    *) printf '[source.crates-io]\nreplace-with = "china-mirror"\n[source.china-mirror]\nregistry = "%s"\n' \
+         "$SAG_CARGO_REGISTRY_MIRROR" > /usr/local/cargo/config.toml ;; \
+  esac
 
 COPY . .
 
